@@ -1,6 +1,7 @@
 use clap::Parser;
-use climate_data_service::Service;
+use climate_data_service::{DiagnosticKind, Service};
 use std::{
+    io::Write,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::mpsc,
@@ -39,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ctrlc::set_handler(move || {
         let _ = shutdown.try_send(());
     })?;
+    let (log_sender, log_events) = mpsc::sync_channel(128);
     let _service = Service::start(
         config
             .serial
@@ -47,11 +49,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listener,
         &config.database,
         utc_unix_ms,
-        // Daily raw diagnostic persistence is supplied by the log slice. Keeping
-        // this callback nonblocking prevents terminal/filesystem stalls here.
-        |_| {},
+        // Daily raw diagnostic persistence is supplied by the log slice.
+        // A blocked stderr must not stall serial ingestion or health deadlines.
+        move |diagnostic| {
+            if diagnostic.kind == DiagnosticKind::Operational {
+                let _ = log_sender.try_send((utc_unix_ms(), diagnostic.bytes.to_vec()));
+            }
+        },
     )?;
     eprintln!("Listening on http://{address}");
+    // Intentionally not joined: a stalled output sink cannot prevent shutdown.
+    std::thread::spawn(move || {
+        for (received_at_unix_ms, bytes) in log_events {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "INFO - {received_at_unix_ms} {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    });
     receive_shutdown.recv()?;
     Ok(())
 }

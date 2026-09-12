@@ -14,6 +14,28 @@ pub(crate) struct IndoorReading {
     pub(crate) relative_humidity_percent: f64,
 }
 
+#[derive(Deserialize)]
+struct Envelope {
+    v: u32,
+    #[serde(rename = "type")]
+    record_type: String,
+    boot_id: String,
+}
+
+pub(crate) enum Record {
+    Indoor(IndoorReading),
+    Heartbeat { boot_id: String },
+}
+
+impl Record {
+    pub(crate) fn boot_id(&self) -> &str {
+        match self {
+            Self::Indoor(reading) => &reading.boot_id,
+            Self::Heartbeat { boot_id } => boot_id,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Framer {
     line: Vec<u8>,
@@ -24,7 +46,7 @@ impl Framer {
     pub(crate) fn feed(
         &mut self,
         bytes: &[u8],
-        reading: &mut impl FnMut(IndoorReading),
+        reading: &mut impl FnMut(Record),
         diagnostic: &mut impl FnMut(Diagnostic<'_>),
     ) {
         for &byte in bytes {
@@ -40,7 +62,7 @@ impl Framer {
                 }
             } else if byte == b'\n' {
                 if let Some(json) = self.line.strip_prefix(b"DATA ") {
-                    match parse_indoor(&json[..json.len() - 1]) {
+                    match parse_record(&json[..json.len() - 1]) {
                         Ok(value) => reading(value),
                         Err(_) => diagnostic(Diagnostic {
                             kind: DiagnosticKind::RejectedData,
@@ -70,7 +92,7 @@ impl Framer {
     }
 }
 
-fn parse_indoor(json: &[u8]) -> Result<IndoorReading, ()> {
+fn parse_record(json: &[u8]) -> Result<Record, ()> {
     // Validate even ignored extension fields: serde's derived visitor otherwise
     // skips duplicate unknown keys and may skip invalid UTF-8 in ignored strings.
     if json.contains(&b'\r') {
@@ -79,20 +101,31 @@ fn parse_indoor(json: &[u8]) -> Result<IndoorReading, ()> {
     let mut deserializer = serde_json::Deserializer::from_slice(json);
     serde::Deserializer::deserialize_map(&mut deserializer, UniqueKeys).map_err(|_| ())?;
     deserializer.end().map_err(|_| ())?;
-    let reading: IndoorReading = serde_json::from_slice(json).map_err(|_| ())?;
-    if reading.v != 1
-        || reading.record_type != "indoor"
-        || reading.boot_id.len() != 32
-        || !reading
+    let envelope: Envelope = serde_json::from_slice(json).map_err(|_| ())?;
+    if envelope.v != 1
+        || envelope.boot_id.len() != 32
+        || !envelope
             .boot_id
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || !reading.temperature_celsius.is_finite()
-        || !reading.relative_humidity_percent.is_finite()
     {
         return Err(());
     }
-    Ok(reading)
+    match envelope.record_type.as_str() {
+        "heartbeat" => Ok(Record::Heartbeat {
+            boot_id: envelope.boot_id,
+        }),
+        "indoor" => {
+            let reading: IndoorReading = serde_json::from_slice(json).map_err(|_| ())?;
+            if !reading.temperature_celsius.is_finite()
+                || !reading.relative_humidity_percent.is_finite()
+            {
+                return Err(());
+            }
+            Ok(Record::Indoor(reading))
+        }
+        _ => Err(()),
+    }
 }
 
 /// Traverse the whole JSON document without retaining values. The framing limit

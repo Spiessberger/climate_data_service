@@ -201,7 +201,10 @@ fn history_survives_restart_while_live_state_starts_empty() {
     demo.wait_for_readings("/history/indoor/updates?after_id=0&limit=10", 1);
 
     let demo = demo.restart([]);
-    assert_eq!(demo.get("/live"), (200, json!({"indoor": null})));
+    let (status, live) = demo.get("/live");
+    assert_eq!(status, 200);
+    assert_eq!(live["indoor"], Value::Null);
+    assert_eq!(live["gateway"]["available"], false);
     let history = demo.wait_for_readings("/history/indoor/updates?after_id=0&limit=10", 1);
     assert_eq!(history["readings"][0]["seq"], 7);
     assert_eq!(history["readings"][0]["received_at_unix_ms"], 1_234);

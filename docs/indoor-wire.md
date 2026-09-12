@@ -23,9 +23,18 @@ The host adds UTC reception time; it does not infer sensor measurement time.
 Validate the entire object before publishing. Reject missing/wrongly typed fields,
 invalid identifiers, duplicate keys (including in extensions), invalid UTF-8,
 non-finite/invalid JSON numbers, trailing non-JSON input, and unknown versions or
-types. Accept additional fields on valid version-1 indoor records. Integer fields
-must use integer JSON representations. Weather and heartbeat become supported in
-later slices; they cannot update indoor live readings in this implementation.
+types. Accept additional fields on valid version-1 records. Integer fields
+must use integer JSON representations. Weather remains unsupported until its
+feature slice. Heartbeats are supported with the same validated envelope:
+
+```text
+DATA {"v":1,"type":"heartbeat","boot_id":"6a9d3c1f80b24e67a511d92cb837046e"}
+```
+
+Heartbeats contain no reading counter and never update indoor values or history.
+They share the boot identifier and occur every five seconds independently of
+sensor readings. Extra fields are ignored after validation, as for indoor DATA.
+See [gateway health](gateway-health.md) for the 15-second timeout and continuity.
 
 Only complete LF-terminated lines can become readings. Do not salvage embedded
 JSON or a later DATA prefix within a damaged line. Discard parser state for an

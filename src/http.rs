@@ -115,11 +115,8 @@ async fn respond(
             )
         } else {
             // Clone the small snapshot and release its lock before socket I/O.
-            let indoor = live.read().unwrap().indoor.clone();
-            (
-                StatusCode::OK,
-                serde_json::to_string(&Live { indoor }).unwrap(),
-            )
+            let snapshot = live.read().unwrap().clone();
+            (StatusCode::OK, serde_json::to_string(&snapshot).unwrap())
         }
     } else if request.uri().path() == "/history/indoor" {
         indoor_history(request.uri().query(), history).await

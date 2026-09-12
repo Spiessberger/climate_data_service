@@ -16,6 +16,55 @@ impl Drop for Process {
 }
 
 #[test]
+fn absent_serial_keeps_http_running_and_reports_the_transition_on_stderr() {
+    let directory = tempfile::tempdir().unwrap();
+    let serial_path = directory.path().join("missing-gateway");
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_climate-data-service"))
+            .arg("--serial")
+            .arg(&serial_path)
+            .args(["--listen", "127.0.0.1:0", "--database"])
+            .arg(directory.path().join("climate.sqlite3"))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = process.0.stderr.take().unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let startup = lines.recv_timeout(Duration::from_secs(2)).unwrap();
+    let address = startup
+        .strip_prefix("Listening on http://")
+        .expect(&startup);
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"GET /live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"));
+    let live: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(live["gateway"]["available"], false);
+    assert_eq!(live["indoor"], serde_json::Value::Null);
+    let event = lines
+        .recv_timeout(Duration::from_secs(2))
+        .expect("missing operational transition");
+    assert!(event.contains("serial_unavailable"), "{event}");
+    assert!(event.contains(serial_path.to_str().unwrap()), "{event}");
+    assert!(process.0.try_wait().unwrap().is_none());
+}
+
+#[test]
 fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("history.sqlite3");
@@ -48,7 +97,11 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
         stream.read_to_string(&mut response).unwrap();
         response
     };
-    assert!(request("GET", "/live").ends_with("{\"indoor\":null}"));
+    let response = request("GET", "/live");
+    let live: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(live["indoor"], serde_json::Value::Null);
+    assert_eq!(live["gateway"]["available"], false);
     assert!(request("POST", "/live").starts_with("HTTP/1.1 405"));
     assert!(request("GET", "/missing").starts_with("HTTP/1.1 404"));
     let before = SystemTime::now()

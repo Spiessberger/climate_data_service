@@ -20,17 +20,26 @@ Poll once per second. Stop with Ctrl-C or SIGTERM. The serial connection is open
 at 115200 baud, 8N1 without flow control (native USB Serial/JTAG ignores baud rate).
 Run only one reader on the selected device; stop any serial monitor first.
 
-Before the first valid reading in this process, `/live` returns `{"indoor":null}`.
+Before the first valid reading in this process, `/live` has `"indoor":null` and
+gateway availability is false until a valid heartbeat or indoor reading arrives.
 After reception it returns:
 
 ```json
-{"indoor":{"v":1,"type":"indoor","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":42,"temperature_celsius":21.5,"relative_humidity_percent":48.2,"received_at_unix_ms":1800000000123}}
+{"indoor":{"v":1,"type":"indoor","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":42,"temperature_celsius":21.5,"relative_humidity_percent":48.2,"received_at_unix_ms":1800000000123},"gateway":{"available":true,"boot_id":"6a9d3c1f80b24e67a511d92cb837046e","last_received_at_unix_ms":1800000000123,"restart_count":0,"indoor":{"last_seq":42,"observed_missing_readings":0}}}
 ```
 
 Reception time is the Linux host's UTC Unix milliseconds, not sensor measurement
 time. Each valid arrival replaces the complete live reading. Responses disable
 caching. Unsupported input leaves both values and their reception time unchanged.
 See [the wire contract](docs/indoor-wire.md).
+
+Five-second gateway heartbeats keep communication available during sensor silence.
+After 15 seconds without valid supported DATA, or immediately on detected USB
+disconnection, availability becomes false. Last live values keep their original
+reception times. Only valid returning DATA restores availability. Missing or
+disconnected hardware is retried once per second at the configured path while
+HTTP remains available. See [gateway health](docs/gateway-health.md) for restart,
+counter-gap and diagnostic semantics.
 
 Successfully committed readings are available from `GET /history/indoor` by UTC
 time range and from `GET /history/indoor/updates` after a database row ID. Both
@@ -57,17 +66,16 @@ HTTP address that can also be polled with curl. Ctrl-C stops the process.
 
 ## Scope and continuation
 
-This implements tickets 01 and 02: indoor live HTTP plus retained SQLite history.
-There is no heartbeat/connection health, reconnect, or permanent log storage yet.
-Weather reports remain operational text until the weather slice. An absent
-serial device currently fails startup; a detected disconnection ends ingestion
-while HTTP retains the last reading and original reception time. Restart with the
-configured device to resume. A service restart starts with no live reading.
+This implements tickets 01–03: indoor live HTTP, retained SQLite history, and
+gateway health/reconnect. Weather reports remain operational text until the
+weather slice. A service restart starts with no live reading or counter baseline.
 
 The parser offers original non-data, rejected, overlong and partial bytes to a
-bounded-chunk diagnostic callback. The foreground binary currently discards these
-chunks. The later log slice supplies a nonblocking persistence handoff; it must not
-write files synchronously from this callback. No diagnostic replay backlog exists.
+bounded-chunk diagnostic callback. It also offers service operational transition
+events. The foreground binary prints those events with UTC reception milliseconds
+to stderr using a bounded, nonblocking handoff, and currently discards raw input
+chunks. The later log slice supplies permanent files. No diagnostic replay backlog
+exists; a stalled stderr may lose events but cannot stop ingestion or shutdown.
 
 Serial ingestion, database writes, and HTTP run independently. SQLite is bundled
 so the application controls the runtime version; startup enforces SQLite 3.51.3 or
@@ -89,7 +97,10 @@ cargo test --locked
 Integration tests exercise real pseudo-terminals, temporary SQLite databases, and
 loopback HTTP, including the foreground executable, committed visibility, restart
 persistence, range/incremental ordering, malformed input, byte-preservation
-callbacks, framing recovery, reception time, and delayed writes. They need
+callbacks, framing recovery, reception time, and delayed writes.
+Controlled monotonic and UTC clocks also exercise exact heartbeat deadlines,
+sensor silence, restart/counter continuity and configured-device reconnects.
+The tests need
 permission to bind loopback sockets and use `/dev/pts`. No network downloads are
 needed once dependencies in `Cargo.lock` are cached (`--offline` may be added).
 

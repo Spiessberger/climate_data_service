@@ -38,7 +38,9 @@ impl Demo {
             &directory.path().join("climate.sqlite3"),
             || 1_800_000_000_123,
             move |event| {
-                let _ = send.send((event.kind, event.bytes.to_vec()));
+                if event.kind != DiagnosticKind::Operational {
+                    let _ = send.send((event.kind, event.bytes.to_vec()));
+                }
             },
         )
         .unwrap();
@@ -84,16 +86,16 @@ impl Demo {
 #[test]
 fn serial_indoor_reading_is_live_with_utc_reception_time() {
     let mut demo = Demo::start();
-    assert_eq!(demo.live(), json!({"indoor": null}));
+    assert_eq!(demo.live()["indoor"], Value::Null);
     demo.master.write_all(b"INFO - CC1101 ready\n").unwrap();
     demo.master.write_all(INDOOR.as_bytes()).unwrap();
     assert_eq!(
-        demo.wait_for_seq(42),
-        json!({"indoor": {
+        demo.wait_for_seq(42)["indoor"],
+        json!({
             "v": 1, "type": "indoor", "boot_id": "6a9d3c1f80b24e67a511d92cb837046e", "seq": 42,
             "temperature_celsius": 21.5, "relative_humidity_percent": 48.2,
             "received_at_unix_ms": 1_800_000_000_123_i64
-        }})
+        })
     );
 }
 
@@ -107,7 +109,6 @@ fn invalid_or_unsupported_records_cannot_replace_live_values() {
         INDOOR.replace("\"v\":1", "\"v\":2"),
         INDOOR.replace("\"v\":1", "\"v\":1.0"),
         INDOOR.replace("\"v\":1", "\"v\":true"),
-        INDOOR.replace("indoor", "heartbeat"),
         INDOOR.replace("indoor", "weather"),
         INDOOR.replace("indoor", "future"),
         INDOOR.replace(
@@ -187,7 +188,7 @@ fn split_records_wait_for_lf_and_damaged_lines_recover_without_salvage() {
     for chunk in INDOOR.as_bytes()[..INDOOR.len() - 1].chunks(7) {
         demo.master.write_all(chunk).unwrap();
     }
-    assert_eq!(demo.live(), json!({"indoor": null}));
+    assert_eq!(demo.live()["indoor"], Value::Null);
     demo.master.write_all(b"\n").unwrap();
     let original = demo.wait_for_seq(42);
     let damaged = format!("{}{}", INDOOR.trim_end(), INDOOR);
@@ -265,7 +266,7 @@ fn binary_text_and_long_rejected_input_remain_preservable_in_bounded_chunks() {
             preserved.extend(bytes);
         }
         assert_eq!(preserved, input);
-        assert_eq!(demo.live(), json!({"indoor": null}));
+        assert_eq!(demo.live()["indoor"], Value::Null);
     }
     demo.master.write_all(INDOOR.as_bytes()).unwrap();
     demo.wait_for_seq(42);
@@ -277,7 +278,7 @@ fn disconnect_offers_unterminated_bytes_to_diagnostics() {
     demo.master.write_all(b"DATA {\"v\":1").unwrap();
     // Allow the OS to deliver the partial bytes before destroying the PTY.
     thread::sleep(Duration::from_millis(30));
-    assert_eq!(demo.live(), json!({"indoor": null}));
+    assert_eq!(demo.live()["indoor"], Value::Null);
     drop(demo.master);
     assert_eq!(
         demo.diagnostics

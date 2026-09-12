@@ -38,4 +38,5 @@ zero for all stored readings and continue with the last returned row's `id`.
 
 History contains committed rows only. The separate `/live` capability updates
 before and independently of database writes, has no database row ID, and starts
-with `{"indoor":null}` after every service process restart.
+with `"indoor":null` and gateway availability false after every service process
+restart, until valid new traffic arrives.
