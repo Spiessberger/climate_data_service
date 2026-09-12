@@ -60,10 +60,23 @@ enum ClimateReading {
 }
 
 #[derive(Clone, Default, Serialize)]
+struct LogHealth {
+    available: bool,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize)]
+struct StorageHealth {
+    database: storage::DatabaseStatus,
+    logs: LogHealth,
+}
+
+#[derive(Clone, Default, Serialize)]
 struct Live {
     indoor: Option<LiveIndoorReading>,
     weather: Option<LiveWeatherReading>,
     gateway: health::Gateway,
+    storage: StorageHealth,
 }
 
 fn operational(event: health::Event, diagnostic: &mut impl FnMut(Diagnostic<'_>)) {
@@ -101,12 +114,53 @@ impl Service {
         )
     }
 
+    /// Starts the service with the daily-log worker's shared health state.
+    pub fn start_with_log_status(
+        serial_path: &str,
+        listener: TcpListener,
+        database_path: &Path,
+        log_status: logs::LogStatusHandle,
+        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
+        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
+    ) -> Result<Self, Error> {
+        let started = Instant::now();
+        Self::start_with_clock_and_status(
+            serial_path,
+            listener,
+            database_path,
+            Some(log_status),
+            utc_unix_ms,
+            move || started.elapsed(),
+            diagnostic,
+        )
+    }
+
     /// `elapsed` is a monotonic clock, independent of UTC reception timestamps.
     /// Diagnostic callbacks must remain nonblocking, including operational events.
     pub fn start_with_clock(
         serial_path: &str,
         listener: TcpListener,
         database_path: &Path,
+        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
+        elapsed: impl Fn() -> Duration + Send + 'static,
+        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
+    ) -> Result<Self, Error> {
+        Self::start_with_clock_and_status(
+            serial_path,
+            listener,
+            database_path,
+            None,
+            utc_unix_ms,
+            elapsed,
+            diagnostic,
+        )
+    }
+
+    pub fn start_with_clock_and_status(
+        serial_path: &str,
+        listener: TcpListener,
+        database_path: &Path,
+        log_status: Option<logs::LogStatusHandle>,
         utc_unix_ms: impl Fn() -> i64 + Send + 'static,
         elapsed: impl Fn() -> Duration + Send + 'static,
         mut diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
@@ -117,8 +171,15 @@ impl Service {
             .open();
         let (storage, history) = storage::Storage::start(database_path)?;
         let storage_sender = storage.sender();
+        let database_status = storage.status();
         let live = Arc::new(RwLock::new(Live::default()));
-        let http = http::HttpServer::start(listener, Arc::clone(&live), history)?;
+        let http = http::HttpServer::start(
+            listener,
+            Arc::clone(&live),
+            history,
+            database_status,
+            log_status,
+        )?;
         let stopping = Arc::new(AtomicBool::new(false));
         let serial_live = Arc::clone(&live);
         let serial_stopping = Arc::clone(&stopping);

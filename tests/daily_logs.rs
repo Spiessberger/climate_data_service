@@ -1,4 +1,4 @@
-use climate_data_service::{Service, logs::DailyLogs};
+use climate_data_service::{Diagnostic, DiagnosticKind, Service, logs::DailyLogs};
 use serde_json::Value;
 use serialport::{SerialPort, TTYPort};
 use std::{
@@ -379,5 +379,59 @@ fn failed_sync_remains_unconfirmed_and_retries_dirty_files_without_new_input() {
     master.write_all(INDOOR).unwrap();
     wait_until(|| live(address)["indoor"]["seq"] == 42);
     drop(service);
+    drop(logs);
+}
+
+#[test]
+fn failed_sync_during_date_rollover_retries_the_previous_date() {
+    use climate_data_service::logs::LogSync;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    struct FailOnce(bool);
+    impl LogSync for FailOnce {
+        fn sync(&mut self, file: &fs::File) -> std::io::Result<()> {
+            if self.0 {
+                self.0 = false;
+                return Err(std::io::Error::other("injected rollover sync failure"));
+            }
+            file.sync_all()
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let elapsed = Arc::new(AtomicU64::new(0));
+    let worker_clock = Arc::clone(&elapsed);
+    let logs = DailyLogs::start_with_clock_and_sync(
+        &directory.path().join("logs"),
+        move || Duration::from_secs(worker_clock.load(Ordering::Relaxed)),
+        FailOnce(true),
+    );
+    let sender = logs.sender();
+    sender.record(
+        1_789_171_199_000,
+        Diagnostic {
+            kind: DiagnosticKind::Text,
+            bytes: b"INFO - before rollover\n",
+        },
+    );
+    wait_until(|| {
+        raw_bytes(&directory.path().join("logs/2026-09-11.diagnostic.jsonl"))
+            == b"INFO - before rollover\n"
+    });
+    elapsed.store(60, Ordering::Relaxed);
+    sender.record(
+        1_789_171_200_000,
+        Diagnostic {
+            kind: DiagnosticKind::Text,
+            bytes: b"INFO - after rollover\n",
+        },
+    );
+    wait_until(|| logs.status().synchronized_batches == 2);
+    assert!(logs.status().last_error.is_none());
+    assert_eq!(
+        raw_bytes(&directory.path().join("logs/2026-09-12.diagnostic.jsonl")),
+        b"INFO - after rollover\n"
+    );
     drop(logs);
 }

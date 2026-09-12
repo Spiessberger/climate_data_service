@@ -3,6 +3,7 @@ use crate::{Diagnostic, DiagnosticKind};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -40,9 +41,13 @@ impl LogSender {
 /// Successful batches count disk synchronization, never merely successful appends.
 #[derive(Clone, Default, Debug)]
 pub struct LogStatus {
+    pub available: bool,
     pub synchronized_batches: u64,
     pub last_error: Option<String>,
+    sync_failed: bool,
 }
+
+pub type LogStatusHandle = Arc<Mutex<LogStatus>>;
 
 /// External filesystem synchronization boundary; also used for directory handles.
 pub trait LogSync: Send + 'static {
@@ -85,6 +90,8 @@ impl DailyLogs {
         let mut next_sync = elapsed() + Duration::from_secs(60);
         let thread = thread::spawn(move || {
             let mut files: Option<DayFiles> = None;
+            let mut current_date: Option<String> = None;
+            let mut pending_dates = VecDeque::new();
             loop {
                 let entry = if worker_stopping.load(Ordering::Relaxed) {
                     match receiver.try_recv() {
@@ -107,28 +114,72 @@ impl DailyLogs {
                                 })?
                                 .format("%Y-%m-%d")
                                 .to_string();
-                        if files.as_ref().is_none_or(|files| files.date != date) {
+                        if current_date.as_ref() != Some(&date) {
                             if let Some(mut previous) = files.take() {
-                                synchronize(&mut previous, &mut sync, &worker_status);
+                                let previous_date = previous.date.clone();
+                                if !synchronize(&mut previous, &mut sync, &worker_status) {
+                                    pending_dates.push_back(previous_date);
+                                }
                             }
+                            current_date = Some(date.clone());
+                        }
+                        if files.is_none() {
                             files = Some(DayFiles::open(&directory, date)?);
                         }
                         files.as_mut().unwrap().append(&entry)
                     })();
-                    if let Err(error) = result {
-                        worker_status.lock().unwrap().last_error = Some(error.to_string());
+                    match result {
+                        Ok(()) => mark_written(&worker_status),
+                        Err(error) => {
+                            mark_failed(&worker_status, &error);
+                            // Reopen the configured paths after a write/open failure. Existing
+                            // retained bytes are never removed or replaced.
+                            files = None;
+                        }
                     }
                 }
                 let now = elapsed();
                 if now >= next_sync {
-                    if let Some(files) = files.as_mut() {
-                        synchronize(files, &mut sync, &worker_status);
+                    if files.is_none()
+                        && let Some(date) = current_date.clone()
+                    {
+                        files = match DayFiles::open(&directory, date) {
+                            Ok(files) => Some(files),
+                            Err(error) => {
+                                mark_failed(&worker_status, &error);
+                                None
+                            }
+                        };
+                    }
+                    if let Some(day_files) = files.as_mut()
+                        && !synchronize(day_files, &mut sync, &worker_status)
+                    {
+                        files = None;
+                    }
+                    for _ in 0..pending_dates.len() {
+                        let date = pending_dates.pop_front().unwrap();
+                        match DayFiles::open(&directory, date.clone()) {
+                            Ok(mut previous) => {
+                                if !synchronize(&mut previous, &mut sync, &worker_status) {
+                                    pending_dates.push_back(date);
+                                }
+                            }
+                            Err(error) => {
+                                mark_failed(&worker_status, &error);
+                                pending_dates.push_back(date);
+                            }
+                        }
                     }
                     next_sync = now + Duration::from_secs(60);
                 }
             }
             if let Some(mut files) = files {
                 synchronize(&mut files, &mut sync, &worker_status);
+            }
+            while let Some(date) = pending_dates.pop_front() {
+                if let Ok(mut files) = DayFiles::open(&directory, date) {
+                    synchronize(&mut files, &mut sync, &worker_status);
+                }
             }
         });
         Self {
@@ -141,6 +192,10 @@ impl DailyLogs {
 
     pub fn status(&self) -> LogStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    pub fn status_handle(&self) -> LogStatusHandle {
+        Arc::clone(&self.status)
     }
 
     pub fn sender(&self) -> LogSender {
@@ -206,11 +261,11 @@ impl DayFiles {
     fn open(directory: &Path, date: String) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         Ok(Self {
+            date: date.clone(),
             directory: directory.to_owned(),
             directory_dirty: true,
             operational: DirtyFile::open(directory.join(format!("{date}.operational.jsonl")))?,
             diagnostic: DirtyFile::open(directory.join(format!("{date}.diagnostic.jsonl")))?,
-            date,
         })
     }
 
@@ -258,15 +313,37 @@ impl DayFiles {
     }
 }
 
-fn synchronize(files: &mut DayFiles, sync: &mut impl LogSync, status: &Mutex<LogStatus>) {
+fn synchronize(files: &mut DayFiles, sync: &mut impl LogSync, status: &Mutex<LogStatus>) -> bool {
     let result = files.sync(sync);
     let mut status = status.lock().unwrap();
     match result {
         Ok(true) => {
+            status.available = true;
             status.synchronized_batches += 1;
             status.last_error = None;
+            status.sync_failed = false;
+            true
         }
-        Ok(false) => {}
-        Err(error) => status.last_error = Some(error.to_string()),
+        Ok(false) => true,
+        Err(error) => {
+            status.available = false;
+            status.last_error = Some(error.to_string());
+            status.sync_failed = true;
+            false
+        }
     }
+}
+
+fn mark_written(status: &Mutex<LogStatus>) {
+    let mut status = status.lock().unwrap();
+    if !status.sync_failed {
+        status.available = true;
+        status.last_error = None;
+    }
+}
+
+fn mark_failed(status: &Mutex<LogStatus>, error: &impl std::fmt::Display) {
+    let mut status = status.lock().unwrap();
+    status.available = false;
+    status.last_error = Some(error.to_string());
 }

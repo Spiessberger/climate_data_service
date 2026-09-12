@@ -46,13 +46,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (log_sender, log_events) = mpsc::sync_channel(128);
     let logs = DailyLogs::start(&config.log_dir);
     let file_sender = logs.sender();
-    let service = Service::start(
+    let log_status = logs.status_handle();
+    let service = Service::start_with_log_status(
         config
             .serial
             .to_str()
             .ok_or("serial path must be valid UTF-8")?,
         listener,
         &config.database,
+        log_status,
         utc_unix_ms,
         // A blocked stderr must not stall serial ingestion or health deadlines.
         move |diagnostic| {

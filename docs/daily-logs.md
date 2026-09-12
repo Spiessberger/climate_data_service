@@ -62,10 +62,22 @@ second for the log worker; a stalled system call can outlive that wait. The minu
 cadence is a normal-operation target, not a power-loss guarantee during stalls or
 errors. Recent unsynchronized bytes can be lost on a power cut.
 
-The library's `DailyLogs::status()` reports completed synchronization batches and
-the last worker I/O error. HTTP storage health, comprehensive write failure and
-recovery behavior, and their integration with database failures belong to ticket
-06. The `LogSync` filesystem boundary and elapsed-clock input let integration
-tests observe/fail/block real file and directory synchronization while exercising
-serial input and live HTTP. These host tests do not demonstrate physical
-power-loss durability or hardware USB behavior.
+The library's `DailyLogs::status()` reports whether the most recent file operation
+was successful, completed synchronization batches, and the last worker I/O error.
+The foreground service passes this shared status to `/live`, where it appears as
+the independent `storage.logs` health object. A failed open or append drops the
+current `DayFiles` handle and retries the configured paths on a later entry or
+synchronization tick. A failed synchronization leaves retained files in place,
+reopens them before a later tick, and keeps the health error until a successful
+write or synchronization.
+
+Database health appears beside it as `storage.database`. A database startup or
+write failure leaves live readings, heartbeats and `/live` available; the failed
+arrival is discarded and the writer retries the configured database path without
+replaying it. History continues to return committed rows when the read path is
+available and returns HTTP 500 independently when it is not. These health fields
+remain in memory, so they are available even when the corresponding error cannot
+be appended to a log file. The `LogSync` filesystem boundary and elapsed-clock
+input let integration tests observe/fail/block real file and directory
+synchronization while exercising serial input and live HTTP. These host tests do
+not demonstrate physical power-loss durability or hardware USB behavior.

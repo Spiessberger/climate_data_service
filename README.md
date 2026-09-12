@@ -28,7 +28,7 @@ gateway availability is false until a valid heartbeat or indoor reading arrives.
 After reception it returns:
 
 ```json
-{"indoor":{"v":1,"type":"indoor","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":42,"temperature_celsius":21.5,"relative_humidity_percent":48.2,"received_at_unix_ms":1800000000123},"gateway":{"available":true,"boot_id":"6a9d3c1f80b24e67a511d92cb837046e","last_received_at_unix_ms":1800000000123,"restart_count":0,"indoor":{"last_seq":42,"observed_missing_readings":0}}}
+{"indoor":{"v":1,"type":"indoor","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":42,"temperature_celsius":21.5,"relative_humidity_percent":48.2,"received_at_unix_ms":1800000000123},"weather":null,"gateway":{"available":true,"boot_id":"6a9d3c1f80b24e67a511d92cb837046e","last_received_at_unix_ms":1800000000123,"restart_count":0,"indoor":{"last_seq":42,"observed_missing_readings":0},"weather":{"last_seq":null,"observed_missing_readings":0}},"storage":{"database":{"available":true,"last_error":null},"logs":{"available":true,"last_error":null}}}
 ```
 
 Reception time is the Linux host's UTC Unix milliseconds, not sensor measurement
@@ -69,8 +69,9 @@ HTTP address that can also be polled with curl. Ctrl-C stops the process.
 
 ## Scope and continuation
 
-This implements tickets 01–05: indoor and weather live HTTP, retained SQLite
-history, gateway health/reconnect, and daily logs with damaged-input recovery.
+This implements tickets 01–06: indoor and weather live HTTP, retained SQLite
+history, gateway health/reconnect, daily logs with damaged-input recovery, and
+storage failure recovery. `/live` reports database and log-file health separately.
 See [weather readings](docs/weather.md) for the complete weather schema, independent
 live/health state, weather history routes, and the finite weather demonstration. A service restart starts with no live reading or counter baseline.
 
@@ -83,7 +84,7 @@ retained dates. A bounded nonblocking handoff isolates live service from disk
 stalls; saturated handoffs may lose chunks and have no replay backlog. Service
 events also go to stderr through an independent bounded handoff.
 
-Serial ingestion, database writes, and HTTP run independently. SQLite is bundled
+Serial ingestion, database writes, log-file work, and HTTP run independently. SQLite is bundled
 so the application controls the runtime version; startup enforces SQLite 3.51.3 or
 newer. History uses WAL, FULL synchronous commits, a 1000-page passive automatic
 checkpoint threshold, short read connections, and pages capped at 1000 rows.

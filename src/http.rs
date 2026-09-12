@@ -1,6 +1,7 @@
 use crate::{
-    Error, Live,
-    storage::{History, RangeCursor, StoredReading, Stream},
+    Error, Live, LogHealth, StorageHealth,
+    logs::LogStatusHandle,
+    storage::{DatabaseStatusHandle, History, RangeCursor, StoredReading, Stream},
 };
 use http_body_util::Full;
 use hyper::{
@@ -45,6 +46,8 @@ impl HttpServer {
         listener: TcpListener,
         live: Arc<RwLock<Live>>,
         history: History,
+        database_status: DatabaseStatusHandle,
+        log_status: Option<LogStatusHandle>,
     ) -> Result<Self, Error> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -66,9 +69,17 @@ impl HttpServer {
                         let Ok((socket, _)) = accepted else { break };
                         let live = Arc::clone(&live);
                         let client_history = history.clone();
+                        let database_status = Arc::clone(&database_status);
+                        let log_status = log_status.clone();
                         clients.spawn(async move {
                             let service = service_fn(move |request| {
-                                respond(request, Arc::clone(&live), client_history.clone())
+                                respond(
+                                    request,
+                                    Arc::clone(&live),
+                                    client_history.clone(),
+                                    Arc::clone(&database_status),
+                                    log_status.clone(),
+                                )
                             });
                             let mut builder = http1::Builder::new();
                             builder.keep_alive(false).max_buf_size(8192);
@@ -92,6 +103,8 @@ async fn respond(
     request: Request<Incoming>,
     live: Arc<RwLock<Live>>,
     history: History,
+    database_status: DatabaseStatusHandle,
+    log_status: Option<LogStatusHandle>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let known_path = matches!(
         request.uri().path(),
@@ -119,7 +132,20 @@ async fn respond(
             )
         } else {
             // Clone the small snapshot and release its lock before socket I/O.
-            let snapshot = live.read().unwrap().clone();
+            let mut snapshot = live.read().unwrap().clone();
+            snapshot.storage = StorageHealth {
+                database: database_status.read().unwrap().clone(),
+                logs: log_status
+                    .as_ref()
+                    .map(|status| {
+                        let status = status.lock().unwrap();
+                        LogHealth {
+                            available: status.available,
+                            last_error: status.last_error.clone(),
+                        }
+                    })
+                    .unwrap_or_default(),
+            };
             (StatusCode::OK, serde_json::to_string(&snapshot).unwrap())
         }
     } else {
