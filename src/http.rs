@@ -1,4 +1,7 @@
-use crate::{Error, Live, storage::History};
+use crate::{
+    Error, Live,
+    storage::{History, IndoorRangeCursor, StoredIndoorReading},
+};
 use http_body_util::Full;
 use hyper::{
     Request, Response, StatusCode,
@@ -8,6 +11,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use std::{
+    collections::BTreeMap,
     convert::Infallible,
     net::TcpListener,
     sync::{Arc, RwLock},
@@ -15,6 +19,21 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::oneshot, task::JoinSet};
+
+const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_PAGE_LIMIT: usize = 1_000;
+
+struct IndoorRangeQuery {
+    from_unix_ms: i64,
+    to_unix_ms: i64,
+    after: Option<IndoorRangeCursor>,
+    limit: usize,
+}
+
+struct IndoorUpdatesQuery {
+    after_id: i64,
+    limit: usize,
+}
 
 pub(crate) struct HttpServer {
     shutdown: Option<oneshot::Sender<()>>,
@@ -118,85 +137,127 @@ async fn respond(
 }
 
 async fn indoor_updates(query: Option<&str>, history: History) -> (StatusCode, String) {
-    let parsed = (|| {
-        let mut after_id = None;
-        let mut limit = None;
-        for parameter in query.ok_or(())?.split('&') {
-            let (name, value) = parameter.split_once('=').ok_or(())?;
-            match name {
-                "after_id" if after_id.is_none() => {
-                    after_id = Some(value.parse::<i64>().map_err(|_| ())?)
-                }
-                "limit" if limit.is_none() => limit = Some(value.parse::<usize>().map_err(|_| ())?),
-                _ => return Err(()),
-            }
-        }
-        let (after_id, limit) = (after_id.ok_or(())?, limit.unwrap_or(100));
-        if after_id < 0 || !(1..=1000).contains(&limit) {
-            return Err(());
-        }
-        Ok((after_id, limit))
-    })();
-    let Ok((after_id, limit)) = parsed else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "{\"error\":\"invalid history query\"}".to_owned(),
-        );
+    let Ok(query) = parse_indoor_updates(query) else {
+        return invalid_history_query();
     };
-    match tokio::task::spawn_blocking(move || history.indoor_after(after_id, limit)).await {
-        Ok(Ok(readings)) => (
-            StatusCode::OK,
-            serde_json::to_string(&serde_json::json!({"readings": readings})).unwrap(),
-        ),
-        Ok(Err(_)) | Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{\"error\":\"history unavailable\"}".to_owned(),
-        ),
-    }
+    let result =
+        tokio::task::spawn_blocking(move || history.indoor_after(query.after_id, query.limit))
+            .await;
+    history_response(result)
 }
 
 async fn indoor_history(query: Option<&str>, history: History) -> (StatusCode, String) {
-    let parsed = (|| {
-        let mut from = None;
-        let mut to = None;
-        let mut after_time = None;
-        let mut after_id = None;
-        let mut limit = None;
-        for parameter in query.ok_or(())?.split('&') {
-            let (name, value) = parameter.split_once('=').ok_or(())?;
-            match name {
-                "from_unix_ms" if from.is_none() => {
-                    from = Some(value.parse::<i64>().map_err(|_| ())?)
-                }
-                "to_unix_ms" if to.is_none() => to = Some(value.parse::<i64>().map_err(|_| ())?),
-                "after_received_at_unix_ms" if after_time.is_none() => {
-                    after_time = Some(value.parse::<i64>().map_err(|_| ())?)
-                }
-                "after_id" if after_id.is_none() => {
-                    after_id = Some(value.parse::<i64>().map_err(|_| ())?)
-                }
-                "limit" if limit.is_none() => limit = Some(value.parse::<usize>().map_err(|_| ())?),
-                _ => return Err(()),
-            }
-        }
-        let (from, to, limit) = (from.ok_or(())?, to.ok_or(())?, limit.unwrap_or(100));
-        let after = match (after_time, after_id) {
-            (None, None) => None,
-            (Some(time), Some(id)) if id >= 0 => Some((time, id)),
-            _ => return Err(()),
-        };
-        if from > to || !(1..=1000).contains(&limit) {
+    let Ok(query) = parse_indoor_range(query) else {
+        return invalid_history_query();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        history.indoor_range(
+            query.from_unix_ms,
+            query.to_unix_ms,
+            query.after,
+            query.limit,
+        )
+    })
+    .await;
+    history_response(result)
+}
+
+fn parse_indoor_updates(query: Option<&str>) -> Result<IndoorUpdatesQuery, ()> {
+    let mut parameters = query_parameters(query, &["after_id", "limit"])?;
+    let after_id = required_i64(&mut parameters, "after_id")?;
+    if after_id < 0 {
+        return Err(());
+    }
+    Ok(IndoorUpdatesQuery {
+        after_id,
+        limit: page_limit(&mut parameters)?,
+    })
+}
+
+fn parse_indoor_range(query: Option<&str>) -> Result<IndoorRangeQuery, ()> {
+    let mut parameters = query_parameters(
+        query,
+        &[
+            "from_unix_ms",
+            "to_unix_ms",
+            "after_received_at_unix_ms",
+            "after_id",
+            "limit",
+        ],
+    )?;
+    let from_unix_ms = required_i64(&mut parameters, "from_unix_ms")?;
+    let to_unix_ms = required_i64(&mut parameters, "to_unix_ms")?;
+    if from_unix_ms > to_unix_ms {
+        return Err(());
+    }
+    let after = match (
+        optional_i64(&mut parameters, "after_received_at_unix_ms")?,
+        optional_i64(&mut parameters, "after_id")?,
+    ) {
+        (None, None) => None,
+        (Some(received_at_unix_ms), Some(id)) if id >= 0 => Some(IndoorRangeCursor {
+            received_at_unix_ms,
+            id,
+        }),
+        _ => return Err(()),
+    };
+    Ok(IndoorRangeQuery {
+        from_unix_ms,
+        to_unix_ms,
+        after,
+        limit: page_limit(&mut parameters)?,
+    })
+}
+
+fn query_parameters<'a>(
+    query: Option<&'a str>,
+    allowed: &[&str],
+) -> Result<BTreeMap<&'a str, &'a str>, ()> {
+    let mut parameters = BTreeMap::new();
+    for parameter in query.ok_or(())?.split('&') {
+        let (name, value) = parameter.split_once('=').ok_or(())?;
+        if !allowed.contains(&name) || parameters.insert(name, value).is_some() {
             return Err(());
         }
-        Ok((from, to, after, limit))
-    })();
-    let Ok((from, to, after, limit)) = parsed else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "{\"error\":\"invalid history query\"}".to_owned(),
-        );
-    };
-    match tokio::task::spawn_blocking(move || history.indoor_range(from, to, after, limit)).await {
+    }
+    Ok(parameters)
+}
+
+fn required_i64(parameters: &mut BTreeMap<&str, &str>, name: &str) -> Result<i64, ()> {
+    optional_i64(parameters, name)?.ok_or(())
+}
+
+fn optional_i64(parameters: &mut BTreeMap<&str, &str>, name: &str) -> Result<Option<i64>, ()> {
+    parameters
+        .remove(name)
+        .map(|value| value.parse().map_err(|_| ()))
+        .transpose()
+}
+
+fn page_limit(parameters: &mut BTreeMap<&str, &str>) -> Result<usize, ()> {
+    let limit = parameters
+        .remove("limit")
+        .map(|value| value.parse::<usize>().map_err(|_| ()))
+        .transpose()?
+        .unwrap_or(DEFAULT_PAGE_LIMIT);
+    if (1..=MAX_PAGE_LIMIT).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(())
+    }
+}
+
+fn invalid_history_query() -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        "{\"error\":\"invalid history query\"}".to_owned(),
+    )
+}
+
+fn history_response(
+    result: Result<rusqlite::Result<Vec<StoredIndoorReading>>, tokio::task::JoinError>,
+) -> (StatusCode, String) {
+    match result {
         Ok(Ok(readings)) => (
             StatusCode::OK,
             serde_json::to_string(&serde_json::json!({"readings": readings})).unwrap(),

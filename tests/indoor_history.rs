@@ -256,17 +256,24 @@ fn sqlite_schema_and_runtime_preserve_the_required_metadata() {
             .unwrap(),
         "wal"
     );
+    let storage_settings = connection
+        .prepare("SELECT key, value FROM service_metadata ORDER BY key")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
     assert_eq!(
-        connection
-            .pragma_query_value(None, "synchronous", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        2
-    );
-    assert_eq!(
-        connection
-            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        1_000
+        storage_settings,
+        [
+            ("journal_mode", "wal"),
+            ("sqlite_version", rusqlite::version()),
+            ("synchronous", "2"),
+            ("wal_autocheckpoint", "1000"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
     );
     assert!(rusqlite::version_number() >= 3_051_003);
 }
@@ -309,4 +316,40 @@ fn history_http_is_read_only_and_rejects_unbounded_or_ambiguous_queries() {
             .0,
         405
     );
+}
+
+#[test]
+fn a_slow_history_client_does_not_block_live_http() {
+    let mut demo = Demo::start([2_000]);
+    let mut connection = rusqlite::Connection::open(&demo.database_path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO indoor_readings (
+                    received_at_unix_ms, v, type, boot_id, seq,
+                    temperature_celsius, relative_humidity_percent
+                ) VALUES (?1, 1, 'indoor', ?2, ?3, 20.0, 40.0)",
+            )
+            .unwrap();
+        let large_value = "a".repeat(8_192);
+        for id in 1..=1_000 {
+            insert
+                .execute(rusqlite::params![id, large_value, id])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+
+    let mut slow = TcpStream::connect(demo.address).unwrap();
+    slow.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    slow.write_all(
+        b"GET /history/indoor/updates?after_id=0&limit=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut first_byte = [0];
+    assert_eq!(slow.peek(&mut first_byte).unwrap(), 1);
+
+    demo.send(1);
+    assert_eq!(demo.wait_for_live_seq(1)["indoor"]["seq"], 1);
 }
