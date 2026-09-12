@@ -19,11 +19,13 @@ struct Demo {
     master: TTYPort,
     address: SocketAddr,
     _service: Service,
+    _directory: tempfile::TempDir,
     diagnostics: Receiver<(DiagnosticKind, Vec<u8>)>,
 }
 
 impl Demo {
     fn start() -> Self {
+        let directory = tempfile::tempdir().unwrap();
         let (master, slave) = TTYPort::pair().unwrap();
         let serial_path = slave.name().unwrap();
         drop(slave);
@@ -33,6 +35,7 @@ impl Demo {
         let service = Service::start(
             &serial_path,
             listener,
+            &directory.path().join("climate.sqlite3"),
             || 1_800_000_000_123,
             move |event| {
                 let _ = send.send((event.kind, event.bytes.to_vec()));
@@ -43,6 +46,7 @@ impl Demo {
             master,
             address,
             _service: service,
+            _directory: directory,
             diagnostics,
         }
     }

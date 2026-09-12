@@ -10,7 +10,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Receive gateway indoor readings over USB and serve live HTTP"
+    about = "Receive gateway indoor readings over USB and serve live and historical HTTP"
 )]
 struct Config {
     /// Explicit Linux serial device (or stable device symlink); never auto-selected
@@ -19,6 +19,9 @@ struct Config {
     /// Read-only, unauthenticated HTTP address on a trusted network
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    /// Local SQLite database containing retained climate history
+    #[arg(long, default_value = "./data/climate.sqlite3")]
+    database: PathBuf,
 }
 
 fn utc_unix_ms() -> i64 {
@@ -42,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .to_str()
             .ok_or("serial path must be valid UTF-8")?,
         listener,
+        &config.database,
         utc_unix_ms,
         // Daily raw diagnostic persistence is supplied by the log slice. Keeping
         // this callback nonblocking prevents terminal/filesystem stalls here.

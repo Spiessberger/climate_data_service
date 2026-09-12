@@ -1,10 +1,12 @@
 mod http;
+mod storage;
 mod wire;
 
 use serde::Serialize;
 use std::{
     io::{self, Read},
     net::TcpListener,
+    path::Path,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -44,26 +46,29 @@ struct Live {
     indoor: Option<LiveIndoorReading>,
 }
 
-/// One explicitly selected serial device and a read-only live HTTP endpoint.
-/// No stored readings or diagnostic backlog are retained by this slice.
+/// One explicitly selected serial device with read-only live and history HTTP.
 pub struct Service {
     stopping: Arc<AtomicBool>,
     serial_thread: Option<JoinHandle<()>>,
     http: Option<http::HttpServer>,
+    storage: Option<storage::Storage>,
 }
 
 impl Service {
     pub fn start(
         serial_path: &str,
         listener: TcpListener,
+        database_path: &Path,
         utc_unix_ms: impl Fn() -> i64 + Send + 'static,
         mut diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
     ) -> Result<Self, Error> {
         let mut serial = serialport::new(serial_path, 115_200)
             .timeout(Duration::from_millis(100))
             .open()?;
+        let (storage, history) = storage::Storage::start(database_path)?;
+        let storage_sender = storage.sender();
         let live = Arc::new(RwLock::new(Live::default()));
-        let http = http::HttpServer::start(listener, Arc::clone(&live))?;
+        let http = http::HttpServer::start(listener, Arc::clone(&live), history)?;
         let stopping = Arc::new(AtomicBool::new(false));
         let serial_live = Arc::clone(&live);
         let serial_stopping = Arc::clone(&stopping);
@@ -80,7 +85,8 @@ impl Service {
                                 reading,
                                 received_at_unix_ms: utc_unix_ms(),
                             };
-                            serial_live.write().unwrap().indoor = Some(reading);
+                            serial_live.write().unwrap().indoor = Some(reading.clone());
+                            let _ = storage_sender.try_send(reading);
                         },
                         &mut diagnostic,
                     ),
@@ -98,6 +104,7 @@ impl Service {
             stopping,
             serial_thread: Some(serial_thread),
             http: Some(http),
+            storage: Some(storage),
         })
     }
 }
@@ -109,5 +116,6 @@ impl Drop for Service {
         if let Some(thread) = self.serial_thread.take() {
             let _ = thread.join();
         }
+        self.storage.take();
     }
 }

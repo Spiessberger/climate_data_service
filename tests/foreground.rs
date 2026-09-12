@@ -17,12 +17,15 @@ impl Drop for Process {
 
 #[test]
 fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("history.sqlite3");
     let (mut master, slave) = TTYPort::pair().unwrap();
     let serial = slave.name().unwrap();
     drop(slave);
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_climate-data-service"))
-            .args(["--serial", &serial, "--listen", "127.0.0.1:0"])
+            .args(["--serial", &serial, "--listen", "127.0.0.1:0", "--database"])
+            .arg(&database)
             .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -70,6 +73,21 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
         assert!(Instant::now() < deadline);
         thread::sleep(Duration::from_millis(5));
     }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let response = request("GET", "/history/indoor/updates?after_id=0&limit=10");
+        let value: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        if value["readings"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 1)
+        {
+            assert_eq!(value["readings"][0]["seq"], 1);
+            break;
+        }
+        assert!(Instant::now() < deadline, "reading was not stored: {value}");
+        thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         Command::new("kill")
             .args(["-TERM", &process.0.id().to_string()])
@@ -104,9 +122,7 @@ fn serial_selection_is_required_and_http_defaults_to_loopback() {
         .output()
         .unwrap();
     assert!(help.status.success());
-    assert!(
-        String::from_utf8(help.stdout)
-            .unwrap()
-            .contains("127.0.0.1:8080")
-    );
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("127.0.0.1:8080"));
+    assert!(help.contains("./data/climate.sqlite3"));
 }

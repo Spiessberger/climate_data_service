@@ -5,13 +5,13 @@ const MAX_RECORD_BYTES: usize = 1024;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct IndoorReading {
-    v: u32,
+    pub(crate) v: u32,
     #[serde(rename = "type")]
-    record_type: String,
-    boot_id: String,
-    seq: u32,
-    temperature_celsius: f64,
-    relative_humidity_percent: f64,
+    pub(crate) record_type: String,
+    pub(crate) boot_id: String,
+    pub(crate) seq: u32,
+    pub(crate) temperature_celsius: f64,
+    pub(crate) relative_humidity_percent: f64,
 }
 
 #[derive(Default)]
