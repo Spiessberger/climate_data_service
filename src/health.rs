@@ -79,6 +79,7 @@ pub(crate) struct Gateway {
     pub(crate) last_received_at_unix_ms: Option<i64>,
     restart_count: u64,
     indoor: StreamContinuity,
+    weather: StreamContinuity,
     #[serde(skip)]
     last_traffic: Option<Duration>,
 }
@@ -99,6 +100,7 @@ impl Gateway {
             });
             self.restart_count = self.restart_count.saturating_add(1);
             self.indoor.last_seq = None;
+            self.weather.last_seq = None;
         }
         self.boot_id = Some(boot_id.to_owned());
         self.last_traffic = Some(now);
@@ -114,6 +116,16 @@ impl Gateway {
     pub(crate) fn indoor(&mut self, seq: u32) -> Option<Event> {
         self.indoor.observe(
             "indoor",
+            self.boot_id
+                .as_deref()
+                .expect("validated record establishes boot"),
+            seq,
+        )
+    }
+
+    pub(crate) fn weather(&mut self, seq: u32) -> Option<Event> {
+        self.weather.observe(
+            "weather",
             self.boot_id
                 .as_deref()
                 .expect("validated record establishes boot"),

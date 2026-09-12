@@ -14,6 +14,46 @@ pub(crate) struct IndoorReading {
     pub(crate) relative_humidity_percent: f64,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct WeatherReading {
+    pub(crate) v: u32,
+    #[serde(rename = "type")]
+    pub(crate) record_type: String,
+    pub(crate) boot_id: String,
+    pub(crate) seq: u32,
+    pub(crate) station_id: u8,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) temperature_celsius: Option<f64>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) relative_humidity_percent: Option<u8>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) wind_direction_degrees: Option<u16>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) wind_speed_mps: Option<f64>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) gust_speed_mps: Option<f64>,
+    pub(crate) rain_mm: f64,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) uv_microwatts_per_cm2: Option<u16>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) uv_index: Option<u8>,
+    #[serde(deserialize_with = "required_nullable")]
+    pub(crate) light_lux: Option<f64>,
+    pub(crate) battery_low: bool,
+    pub(crate) rssi_dbm: f64,
+    pub(crate) lqi: u8,
+}
+
+// Nullable version-1 fields must still be present; serde's ordinary Option
+// handling would silently treat a missing field as null.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
 #[derive(Deserialize)]
 struct Envelope {
     v: u32,
@@ -24,6 +64,7 @@ struct Envelope {
 
 pub(crate) enum Record {
     Indoor(IndoorReading),
+    Weather(WeatherReading),
     Heartbeat { boot_id: String },
 }
 
@@ -31,6 +72,7 @@ impl Record {
     pub(crate) fn boot_id(&self) -> &str {
         match self {
             Self::Indoor(reading) => &reading.boot_id,
+            Self::Weather(reading) => &reading.boot_id,
             Self::Heartbeat { boot_id } => boot_id,
         }
     }
@@ -132,6 +174,24 @@ fn parse_record(json: &[u8]) -> Result<Record, ()> {
                 return Err(());
             }
             Ok(Record::Indoor(reading))
+        }
+        "weather" => {
+            let reading: WeatherReading = serde_json::from_slice(json).map_err(|_| ())?;
+            if [
+                reading.temperature_celsius,
+                reading.wind_speed_mps,
+                reading.gust_speed_mps,
+                reading.light_lux,
+                Some(reading.rain_mm),
+                Some(reading.rssi_dbm),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+            {
+                return Err(());
+            }
+            Ok(Record::Weather(reading))
         }
         _ => Err(()),
     }

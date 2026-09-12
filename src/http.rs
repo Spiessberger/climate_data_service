@@ -1,6 +1,6 @@
 use crate::{
     Error, Live,
-    storage::{History, IndoorRangeCursor, StoredIndoorReading},
+    storage::{History, RangeCursor, StoredReading, Stream},
 };
 use http_body_util::Full;
 use hyper::{
@@ -23,14 +23,14 @@ use tokio::{sync::oneshot, task::JoinSet};
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 1_000;
 
-struct IndoorRangeQuery {
+struct RangeQuery {
     from_unix_ms: i64,
     to_unix_ms: i64,
-    after: Option<IndoorRangeCursor>,
+    after: Option<RangeCursor>,
     limit: usize,
 }
 
-struct IndoorUpdatesQuery {
+struct UpdatesQuery {
     after_id: i64,
     limit: usize,
 }
@@ -95,7 +95,11 @@ async fn respond(
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let known_path = matches!(
         request.uri().path(),
-        "/live" | "/history/indoor" | "/history/indoor/updates"
+        "/live"
+            | "/history/indoor"
+            | "/history/indoor/updates"
+            | "/history/weather"
+            | "/history/weather/updates"
     );
     let (status, body) = if !known_path {
         (
@@ -118,10 +122,17 @@ async fn respond(
             let snapshot = live.read().unwrap().clone();
             (StatusCode::OK, serde_json::to_string(&snapshot).unwrap())
         }
-    } else if request.uri().path() == "/history/indoor" {
-        indoor_history(request.uri().query(), history).await
     } else {
-        indoor_updates(request.uri().query(), history).await
+        let stream = if request.uri().path().starts_with("/history/weather") {
+            Stream::Weather
+        } else {
+            Stream::Indoor
+        };
+        if request.uri().path().ends_with("/updates") {
+            history_updates(request.uri().query(), history, stream).await
+        } else {
+            range_history(request.uri().query(), history, stream).await
+        }
     };
     let mut response = Response::builder()
         .status(status)
@@ -133,22 +144,31 @@ async fn respond(
     Ok(response.body(Full::new(Bytes::from(body))).unwrap())
 }
 
-async fn indoor_updates(query: Option<&str>, history: History) -> (StatusCode, String) {
-    let Ok(query) = parse_indoor_updates(query) else {
+async fn history_updates(
+    query: Option<&str>,
+    history: History,
+    stream: Stream,
+) -> (StatusCode, String) {
+    let Ok(query) = parse_history_updates(query) else {
         return invalid_history_query();
     };
     let result =
-        tokio::task::spawn_blocking(move || history.indoor_after(query.after_id, query.limit))
+        tokio::task::spawn_blocking(move || history.after(stream, query.after_id, query.limit))
             .await;
     history_response(result)
 }
 
-async fn indoor_history(query: Option<&str>, history: History) -> (StatusCode, String) {
-    let Ok(query) = parse_indoor_range(query) else {
+async fn range_history(
+    query: Option<&str>,
+    history: History,
+    stream: Stream,
+) -> (StatusCode, String) {
+    let Ok(query) = parse_history_range(query) else {
         return invalid_history_query();
     };
     let result = tokio::task::spawn_blocking(move || {
-        history.indoor_range(
+        history.range(
+            stream,
             query.from_unix_ms,
             query.to_unix_ms,
             query.after,
@@ -159,19 +179,19 @@ async fn indoor_history(query: Option<&str>, history: History) -> (StatusCode, S
     history_response(result)
 }
 
-fn parse_indoor_updates(query: Option<&str>) -> Result<IndoorUpdatesQuery, ()> {
+fn parse_history_updates(query: Option<&str>) -> Result<UpdatesQuery, ()> {
     let mut parameters = query_parameters(query, &["after_id", "limit"])?;
     let after_id = required_i64(&mut parameters, "after_id")?;
     if after_id < 0 {
         return Err(());
     }
-    Ok(IndoorUpdatesQuery {
+    Ok(UpdatesQuery {
         after_id,
         limit: page_limit(&mut parameters)?,
     })
 }
 
-fn parse_indoor_range(query: Option<&str>) -> Result<IndoorRangeQuery, ()> {
+fn parse_history_range(query: Option<&str>) -> Result<RangeQuery, ()> {
     let mut parameters = query_parameters(
         query,
         &[
@@ -192,13 +212,13 @@ fn parse_indoor_range(query: Option<&str>) -> Result<IndoorRangeQuery, ()> {
         optional_i64(&mut parameters, "after_id")?,
     ) {
         (None, None) => None,
-        (Some(received_at_unix_ms), Some(id)) if id >= 0 => Some(IndoorRangeCursor {
+        (Some(received_at_unix_ms), Some(id)) if id >= 0 => Some(RangeCursor {
             received_at_unix_ms,
             id,
         }),
         _ => return Err(()),
     };
-    Ok(IndoorRangeQuery {
+    Ok(RangeQuery {
         from_unix_ms,
         to_unix_ms,
         after,
@@ -252,7 +272,7 @@ fn invalid_history_query() -> (StatusCode, String) {
 }
 
 fn history_response(
-    result: Result<rusqlite::Result<Vec<StoredIndoorReading>>, tokio::task::JoinError>,
+    result: Result<rusqlite::Result<Vec<StoredReading>>, tokio::task::JoinError>,
 ) -> (StatusCode, String) {
     match result {
         Ok(Ok(readings)) => (

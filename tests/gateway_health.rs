@@ -338,3 +338,142 @@ fn only_valid_supported_records_refresh_health_and_readings_keep_their_age() {
         "steady heartbeats must not repeat transitions"
     );
 }
+
+impl Demo {
+    fn weather(&mut self, boot: &str, seq: u32, station: u8) -> Value {
+        let mut record: Value = serde_json::from_str(
+            include_str!("fixtures/weather.data")
+                .trim()
+                .strip_prefix("DATA ")
+                .unwrap(),
+        )
+        .unwrap();
+        record["boot_id"] = boot.into();
+        record["seq"] = seq.into();
+        record["station_id"] = station.into();
+        writeln!(self.master, "DATA {record}").unwrap();
+        self.wait_for(|live| {
+            live["weather"]["seq"] == seq
+                && live["weather"]["boot_id"] == boot
+                && live["weather"]["station_id"] == station
+        })
+    }
+}
+
+#[test]
+fn weather_continuity_is_independent_of_indoor_station_identity_and_heartbeats() {
+    let mut demo = Demo::start();
+    demo.heartbeat(BOOT);
+    let first = demo.reading(BOOT, 7);
+    assert_eq!(first["weather"], Value::Null);
+    demo.weather(BOOT, u32::MAX, 191);
+    let wrapped = demo.weather(BOOT, 0, 191);
+    assert_eq!(
+        wrapped["gateway"]["weather"]["observed_missing_readings"],
+        0
+    );
+    let changed = demo.weather(BOOT, 3, 1);
+    assert_eq!(changed["gateway"]["restart_count"], 0);
+    assert_eq!(
+        changed["gateway"]["weather"]["observed_missing_readings"],
+        2
+    );
+    assert_eq!(changed["gateway"]["indoor"]["observed_missing_readings"], 0);
+    let event = demo.event("reading_gap");
+    assert_eq!(event["stream"], "weather");
+    assert_eq!(event["observed_missing"], 2);
+    demo.elapsed_ms.store(15_000, Ordering::SeqCst);
+    let lost = demo.wait_for(|live| live["gateway"]["available"] == false);
+    assert_eq!(lost["weather"], changed["weather"]);
+    demo.heartbeat(BOOT);
+    let recovered = demo.wait_for(|live| live["gateway"]["available"] == true);
+    assert_eq!(recovered["weather"], changed["weather"]);
+    assert_eq!(recovered["indoor"], first["indoor"]);
+    let next_boot = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    demo.heartbeat(next_boot);
+    let restarted = demo.wait_for(|live| live["gateway"]["boot_id"] == next_boot);
+    assert_eq!(restarted["gateway"]["weather"]["last_seq"], Value::Null);
+    assert_eq!(restarted["gateway"]["indoor"]["last_seq"], Value::Null);
+    assert_eq!(restarted["weather"], changed["weather"]);
+    let new = demo.weather(next_boot, 99, 1);
+    assert_eq!(new["gateway"]["weather"]["observed_missing_readings"], 2);
+    assert_eq!(new["gateway"]["restart_count"], 1);
+    let third_boot = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let new = demo.weather(third_boot, 1, 1);
+    assert_eq!(new["gateway"]["weather"]["observed_missing_readings"], 2);
+    assert_eq!(new["gateway"]["restart_count"], 2);
+}
+
+#[test]
+fn malformed_weather_never_refreshes_health_or_changes_live_values() {
+    let mut demo = Demo::start();
+    let original = demo.weather(BOOT, 1, 191);
+    let fixture = include_str!("fixtures/weather.data");
+    let record: Value =
+        serde_json::from_str(fixture.trim().strip_prefix("DATA ").unwrap()).unwrap();
+    let mut rejected = Vec::new();
+    for field in record.as_object().unwrap().keys() {
+        let mut missing = record.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        rejected.push(format!("DATA {missing}\n"));
+        let mut wrong_type = record.clone();
+        wrong_type[field] = serde_json::json!([]);
+        rejected.push(format!("DATA {wrong_type}\n"));
+    }
+    for (field, invalid) in [
+        ("station_id", "256"),
+        ("relative_humidity_percent", "-1"),
+        ("wind_direction_degrees", "65536"),
+        ("uv_microwatts_per_cm2", "65536"),
+        ("uv_index", "256"),
+        ("lqi", "1.5"),
+        ("seq", "4294967296"),
+        ("rain_mm", "null"),
+        ("rssi_dbm", "null"),
+        ("wind_speed_mps", "1e999"),
+    ] {
+        let mut candidate = record.clone();
+        candidate.as_object_mut().unwrap().remove(field);
+        rejected.push(format!(
+            "DATA {}\n",
+            candidate
+                .to_string()
+                .replace('}', &format!(",\"{field}\":{invalid}}}"))
+        ));
+    }
+    rejected.push(fixture.replace("\"station_id\":191", "\"station_id\":191,\"station_id\":1"));
+    demo.elapsed_ms.store(14_999, Ordering::SeqCst);
+    for input in rejected {
+        demo.master.write_all(input.as_bytes()).unwrap();
+        loop {
+            let (kind, bytes) = demo
+                .diagnostics
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            if kind == DiagnosticKind::RejectedData {
+                assert_eq!(bytes, input.as_bytes());
+                break;
+            }
+        }
+        assert_eq!(demo.live(), original);
+    }
+    demo.elapsed_ms.store(15_000, Ordering::SeqCst);
+    let lost = demo.wait_for(|live| live["gateway"]["available"] == false);
+    assert_eq!(lost["weather"], original["weather"]);
+    // Permitted extensions and values outside usual physical ranges are accepted.
+    let mut extended = record;
+    extended["seq"] = 2.into();
+    extended["station_id"] = 255.into();
+    extended["relative_humidity_percent"] = 255.into();
+    extended["wind_direction_degrees"] = 65535.into();
+    extended["uv_microwatts_per_cm2"] = 65535.into();
+    extended["uv_index"] = 255.into();
+    extended["lqi"] = 255.into();
+    extended["temperature_celsius"] = (-300).into();
+    extended["extension"] = serde_json::json!({"future": [1, true, null]});
+    writeln!(demo.master, "DATA {extended}").unwrap();
+    let live = demo.wait_for(|live| live["weather"]["seq"] == 2);
+    assert_eq!(live["weather"]["temperature_celsius"], -300.0);
+    assert_eq!(live["weather"]["wind_direction_degrees"], 65535);
+    assert_eq!(live["gateway"]["available"], true);
+}

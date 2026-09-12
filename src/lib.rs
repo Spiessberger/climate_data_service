@@ -16,7 +16,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use wire::{Framer, IndoorReading, Record};
+use wire::{Framer, IndoorReading, Record, WeatherReading};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -45,9 +45,24 @@ struct LiveIndoorReading {
     received_at_unix_ms: i64,
 }
 
+#[derive(Clone, Serialize)]
+struct LiveWeatherReading {
+    #[serde(flatten)]
+    reading: WeatherReading,
+    received_at_unix_ms: i64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum ClimateReading {
+    Indoor(LiveIndoorReading),
+    Weather(LiveWeatherReading),
+}
+
 #[derive(Clone, Default, Serialize)]
 struct Live {
     indoor: Option<LiveIndoorReading>,
+    weather: Option<LiveWeatherReading>,
     gateway: health::Gateway,
 }
 
@@ -174,15 +189,30 @@ impl Service {
                                 now,
                                 received_at_unix_ms,
                             ));
-                            if let Record::Indoor(reading) = record {
-                                transitions.extend(live.gateway.indoor(reading.seq));
-                                let reading = LiveIndoorReading {
-                                    reading,
-                                    received_at_unix_ms,
-                                };
-                                live.indoor = Some(reading.clone());
-                                drop(live);
-                                let _ = storage_sender.try_send(reading);
+                            match record {
+                                Record::Weather(reading) => {
+                                    transitions.extend(live.gateway.weather(reading.seq));
+                                    let reading = LiveWeatherReading {
+                                        reading,
+                                        received_at_unix_ms,
+                                    };
+                                    live.weather = Some(reading.clone());
+                                    drop(live);
+                                    let _ =
+                                        storage_sender.try_send(ClimateReading::Weather(reading));
+                                }
+                                Record::Heartbeat { .. } => {}
+                                Record::Indoor(reading) => {
+                                    transitions.extend(live.gateway.indoor(reading.seq));
+                                    let reading = LiveIndoorReading {
+                                        reading,
+                                        received_at_unix_ms,
+                                    };
+                                    live.indoor = Some(reading.clone());
+                                    drop(live);
+                                    let _ =
+                                        storage_sender.try_send(ClimateReading::Indoor(reading));
+                                }
                             }
                         },
                         &mut diagnostic,

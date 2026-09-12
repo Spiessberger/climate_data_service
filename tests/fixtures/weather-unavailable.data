@@ -1,0 +1,1 @@
+DATA {"v":1,"type":"weather","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":2,"station_id":1,"temperature_celsius":null,"relative_humidity_percent":null,"wind_direction_degrees":null,"wind_speed_mps":null,"gust_speed_mps":null,"rain_mm":19660.5,"uv_microwatts_per_cm2":null,"uv_index":null,"light_lux":null,"battery_low":true,"rssi_dbm":-74,"lqi":0}

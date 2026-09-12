@@ -69,9 +69,10 @@ HTTP address that can also be polled with curl. Ctrl-C stops the process.
 
 ## Scope and continuation
 
-This implements tickets 01–04: indoor live HTTP, retained SQLite history,
-gateway health/reconnect, and daily logs with damaged-input recovery. Weather reports remain operational text until the
-weather slice. A service restart starts with no live reading or counter baseline.
+This implements tickets 01–05: indoor and weather live HTTP, retained SQLite
+history, gateway health/reconnect, and daily logs with damaged-input recovery.
+See [weather readings](docs/weather.md) for the complete weather schema, independent
+live/health state, weather history routes, and the finite weather demonstration. A service restart starts with no live reading or counter baseline.
 
 The parser offers original non-data, rejected, overlong and partial bytes in
 bounded chunks. A dedicated worker appends these losslessly to daily diagnostic
