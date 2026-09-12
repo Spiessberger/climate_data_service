@@ -15,6 +15,7 @@ http-body-util = "0.1"
 tokio = { version = "1", features = ["rt", "net", "sync", "time", "macros"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

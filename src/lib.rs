@@ -1,5 +1,6 @@
 mod health;
 mod http;
+pub mod logs;
 mod storage;
 mod wire;
 
@@ -20,8 +21,8 @@ use wire::{Framer, IndoorReading, Record};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Raw input in bounded chunks, or one JSON service operational event.
-/// Offered synchronously. A future persistence adapter
-/// must use a bounded, nonblocking handoff; it must not write files on this thread.
+/// Offered synchronously. Persistence adapters must use a bounded, nonblocking
+/// handoff (such as `logs::LogSender`); never write files on this thread.
 #[derive(Debug)]
 pub struct Diagnostic<'a> {
     pub kind: DiagnosticKind,

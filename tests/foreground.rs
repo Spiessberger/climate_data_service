@@ -23,6 +23,7 @@ fn absent_serial_keeps_http_running_and_reports_the_transition_on_stderr() {
         Command::new(env!("CARGO_BIN_EXE_climate-data-service"))
             .arg("--serial")
             .arg(&serial_path)
+            .current_dir(directory.path())
             .args(["--listen", "127.0.0.1:0", "--database"])
             .arg(directory.path().join("climate.sqlite3"))
             .stderr(Stdio::piped())
@@ -62,12 +63,40 @@ fn absent_serial_keeps_http_running_and_reports_the_transition_on_stderr() {
     assert!(event.contains("serial_unavailable"), "{event}");
     assert!(event.contains(serial_path.to_str().unwrap()), "{event}");
     assert!(process.0.try_wait().unwrap().is_none());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let retained = std::fs::read_dir(directory.path().join("logs"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("operational.jsonl")
+            })
+            .any(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .unwrap()
+                    .contains("serial_unavailable")
+            });
+        if retained {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "default log directory did not retain the service event"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
 fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("history.sqlite3");
+    let log_dir = directory.path().join("chosen-logs");
     let (mut master, slave) = TTYPort::pair().unwrap();
     let serial = slave.name().unwrap();
     drop(slave);
@@ -75,6 +104,8 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
         Command::new(env!("CARGO_BIN_EXE_climate-data-service"))
             .args(["--serial", &serial, "--listen", "127.0.0.1:0", "--database"])
             .arg(&database)
+            .arg("--log-dir")
+            .arg(&log_dir)
             .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -104,6 +135,9 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
     assert_eq!(live["gateway"]["available"], false);
     assert!(request("POST", "/live").starts_with("HTTP/1.1 405"));
     assert!(request("GET", "/missing").starts_with("HTTP/1.1 404"));
+    master
+        .write_all(b"INFO - foreground log\nPANIC: \xff\n")
+        .unwrap();
     let before = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -157,6 +191,30 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
         assert!(Instant::now() < deadline, "shutdown did not complete");
         thread::sleep(Duration::from_millis(5));
     }
+    let diagnostic = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("diagnostic.jsonl")
+        })
+        .unwrap();
+    let retained: Vec<u8> = std::fs::read_to_string(diagnostic.path())
+        .unwrap()
+        .lines()
+        .flat_map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            record["bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|byte| byte.as_u64().unwrap() as u8)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(retained, b"INFO - foreground log\nPANIC: \xff\n");
 }
 
 #[test]
@@ -178,4 +236,6 @@ fn serial_selection_is_required_and_http_defaults_to_loopback() {
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("127.0.0.1:8080"));
     assert!(help.contains("./data/climate.sqlite3"));
+    assert!(help.contains("./logs"));
+    assert!(help.contains("--log-dir"));
 }

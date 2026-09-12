@@ -39,7 +39,7 @@ impl Record {
 #[derive(Default)]
 pub(crate) struct Framer {
     line: Vec<u8>,
-    discarding: bool,
+    discarding: Option<DiagnosticKind>,
 }
 
 impl Framer {
@@ -51,14 +51,23 @@ impl Framer {
     ) {
         for &byte in bytes {
             self.line.push(byte);
-            if self.discarding || (self.line.len() == MAX_RECORD_BYTES && byte != b'\n') {
+            if self.discarding.is_some() || (self.line.len() == MAX_RECORD_BYTES && byte != b'\n') {
+                let kind = *self.discarding.get_or_insert_with(|| {
+                    if self.line.starts_with(b"DATA ") {
+                        DiagnosticKind::OversizedLine
+                    } else {
+                        DiagnosticKind::Text
+                    }
+                });
                 if self.line.len() == MAX_RECORD_BYTES || byte == b'\n' {
                     diagnostic(Diagnostic {
-                        kind: DiagnosticKind::OversizedLine,
+                        kind,
                         bytes: &self.line,
                     });
                     self.line.clear();
-                    self.discarding = byte != b'\n';
+                    if byte == b'\n' {
+                        self.discarding = None;
+                    }
                 }
             } else if byte == b'\n' {
                 if let Some(json) = self.line.strip_prefix(b"DATA ") {
@@ -88,7 +97,7 @@ impl Framer {
             });
         }
         self.line.clear();
-        self.discarding = false;
+        self.discarding = None;
     }
 }
 

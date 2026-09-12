@@ -14,6 +14,9 @@ curl 'http://127.0.0.1:8080/history/indoor/updates?after_id=0&limit=100'
 
 `--serial` is required. `--database` defaults to `./data/climate.sqlite3`, relative
 to the invocation directory, and its parent directories are created as needed.
+`--log-dir` defaults to `./logs`, also relative to the invocation directory.
+Daily operational and lossless diagnostic files are retained indefinitely; see
+[daily logs](docs/daily-logs.md) for formats, bounded handoff, and synchronization.
 `--listen` defaults to `127.0.0.1:8080`; an explicit trusted network address permits
 remote clients. HTTP is read-only and unauthenticated.
 Poll once per second. Stop with Ctrl-C or SIGTERM. The serial connection is opened
@@ -66,16 +69,18 @@ HTTP address that can also be polled with curl. Ctrl-C stops the process.
 
 ## Scope and continuation
 
-This implements tickets 01–03: indoor live HTTP, retained SQLite history, and
-gateway health/reconnect. Weather reports remain operational text until the
+This implements tickets 01–04: indoor live HTTP, retained SQLite history,
+gateway health/reconnect, and daily logs with damaged-input recovery. Weather reports remain operational text until the
 weather slice. A service restart starts with no live reading or counter baseline.
 
-The parser offers original non-data, rejected, overlong and partial bytes to a
-bounded-chunk diagnostic callback. It also offers service operational transition
-events. The foreground binary prints those events with UTC reception milliseconds
-to stderr using a bounded, nonblocking handoff, and currently discards raw input
-chunks. The later log slice supplies permanent files. No diagnostic replay backlog
-exists; a stalled stderr may lose events but cannot stop ingestion or shutdown.
+The parser offers original non-data, rejected, overlong and partial bytes in
+bounded chunks. A dedicated worker appends these losslessly to daily diagnostic
+files and preserves gateway text and service events in readable operational files.
+Dirty files synchronize every 60 seconds, on date changes, and during ordinary
+shutdown, including directory entries. Restarts and clock rollback append to
+retained dates. A bounded nonblocking handoff isolates live service from disk
+stalls; saturated handoffs may lose chunks and have no replay backlog. Service
+events also go to stderr through an independent bounded handoff.
 
 Serial ingestion, database writes, and HTTP run independently. SQLite is bundled
 so the application controls the runtime version; startup enforces SQLite 3.51.3 or
@@ -96,8 +101,8 @@ cargo test --locked
 
 Integration tests exercise real pseudo-terminals, temporary SQLite databases, and
 loopback HTTP, including the foreground executable, committed visibility, restart
-persistence, range/incremental ordering, malformed input, byte-preservation
-callbacks, framing recovery, reception time, and delayed writes.
+persistence, range/incremental ordering, malformed input, lossless retained files, UTC rotation/rollback, periodic and failed/blocked
+synchronization, framing recovery, reception time, and delayed writes.
 Controlled monotonic and UTC clocks also exercise exact heartbeat deadlines,
 sensor silence, restart/counter continuity and configured-device reconnects.
 The tests need

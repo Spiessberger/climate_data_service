@@ -14,7 +14,7 @@ import urllib.request
 def start_service(binary, serial, database):
     process = subprocess.Popen(
         [str(binary), "--serial", serial, "--listen", "127.0.0.1:0",
-         "--database", str(database)],
+         "--database", str(database), "--log-dir", str(database.parent / "logs")],
         stderr=subprocess.PIPE, text=True,
     )
     startup = process.stderr.readline().strip()
