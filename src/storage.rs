@@ -31,13 +31,13 @@ pub(crate) enum Stream {
 }
 
 impl Stream {
-    fn table(self) -> &'static str {
+    pub(crate) fn table(self) -> &'static str {
         match self {
             Self::Indoor => "indoor_readings",
             Self::Weather => "weather_readings",
         }
     }
-    fn columns(self) -> &'static str {
+    pub(crate) fn columns(self) -> &'static str {
         match self {
             Self::Indoor => INDOOR_COLUMNS,
             Self::Weather => WEATHER_COLUMNS,
@@ -52,7 +52,7 @@ pub(crate) struct RangeCursor {
 
 #[derive(Clone)]
 pub(crate) struct History {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -444,7 +444,10 @@ impl History {
     }
 }
 
-fn row_to_reading(row: &rusqlite::Row<'_>, stream: Stream) -> rusqlite::Result<StoredReading> {
+pub(crate) fn row_to_reading(
+    row: &rusqlite::Row<'_>,
+    stream: Stream,
+) -> rusqlite::Result<StoredReading> {
     let reading = match stream {
         Stream::Indoor => ClimateReading::Indoor(LiveIndoorReading {
             received_at_unix_ms: row.get(1)?,

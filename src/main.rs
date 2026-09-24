@@ -26,6 +26,9 @@ struct Config {
     /// Daily retained operational and lossless diagnostic files
     #[arg(long, default_value = "./logs")]
     log_dir: PathBuf,
+    /// Built web application directory (the contents of weatherstation_web/dist)
+    #[arg(long)]
+    web_root: Option<PathBuf>,
 }
 
 fn utc_unix_ms() -> i64 {
@@ -47,13 +50,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let logs = DailyLogs::start(&config.log_dir);
     let file_sender = logs.sender();
     let log_status = logs.status_handle();
-    let service = Service::start_with_log_status(
+    let service = Service::start_with_web_root_and_log_status(
         config
             .serial
             .to_str()
             .ok_or("serial path must be valid UTF-8")?,
         listener,
         &config.database,
+        config.web_root,
         log_status,
         utc_unix_ms,
         // A blocked stderr must not stall serial ingestion or health deadlines.

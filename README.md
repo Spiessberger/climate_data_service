@@ -7,8 +7,10 @@ readings through read-only HTTP.
 ```sh
 cargo build --locked
 cargo run --locked -- --serial /dev/serial/by-id/YOUR_GATEWAY \
-  --database ./data/climate.sqlite3
+  --database ./data/climate.sqlite3 \
+  --web-root /absolute/path/to/weatherstation_web/dist
 curl http://127.0.0.1:8080/live
+curl http://127.0.0.1:8080/api/v1/dashboard
 curl 'http://127.0.0.1:8080/history/indoor/updates?after_id=0&limit=100'
 ```
 
@@ -19,6 +21,11 @@ Daily operational and lossless diagnostic files are retained indefinitely; see
 [daily logs](docs/daily-logs.md) for formats, bounded handoff, and synchronization.
 `--listen` defaults to `127.0.0.1:8080`; an explicit trusted network address permits
 remote clients. HTTP is read-only and unauthenticated.
+`--web-root` is optional and names the contents of a built web application. When
+set, the service hosts its SPA and hashed assets on the same origin as the APIs.
+See [dashboard and weather summary](docs/dashboard-api.md) for the aggregate API,
+Vienna calendar/rain semantics, resource bounds, error responses and static-file
+rules.
 Poll once per second. Stop with Ctrl-C or SIGTERM. The serial connection is opened
 at 115200 baud, 8N1 without flow control (native USB Serial/JTAG ignores baud rate).
 Run only one reader on the selected device; stop any serial monitor first.
@@ -69,9 +76,10 @@ HTTP address that can also be polled with curl. Ctrl-C stops the process.
 
 ## Scope and continuation
 
-This implements tickets 01–06: indoor and weather live HTTP, retained SQLite
-history, gateway health/reconnect, daily logs with damaged-input recovery, and
-storage failure recovery. `/live` reports database and log-file health separately.
+This implements tickets 01–06 plus the persisted dashboard/summary view: indoor
+and weather live HTTP, retained SQLite history, gateway health/reconnect, daily
+logs with damaged-input recovery, storage failure recovery, and bounded web-facing
+aggregates. `/live` reports database and log-file health separately.
 See [weather readings](docs/weather.md) for the complete weather schema, independent
 live/health state, weather history routes, and the finite weather demonstration. A service restart starts with no live reading or counter baseline.
 
@@ -91,6 +99,9 @@ checkpoint threshold, short read connections, and pages capped at 1000 rows.
 Parser storage is bounded by the 1024-byte record limit, including long ordinary
 text. HTTP admits up to 64 active connections with bounded header buffers and a
 five-second connection deadline; slow clients cannot hold live or database locks.
+Aggregate reads admit at most two jobs, scan no more than 2,000,000 rows for at
+most four seconds, and stream into bounded statistics state. Static files use a
+separate four-job blocking limit and a 16 MiB per-file limit.
 
 ## Development
 

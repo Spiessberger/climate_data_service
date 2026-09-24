@@ -1,3 +1,4 @@
+mod aggregate;
 mod health;
 mod http;
 pub mod logs;
@@ -8,7 +9,7 @@ use serde::Serialize;
 use std::{
     io::{self, Read},
     net::TcpListener,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -95,6 +96,11 @@ pub struct Service {
     storage: Option<storage::Storage>,
 }
 
+struct StartOptions {
+    web_root: Option<PathBuf>,
+    log_status: Option<logs::LogStatusHandle>,
+}
+
 impl Service {
     pub fn start(
         serial_path: &str,
@@ -135,6 +141,55 @@ impl Service {
         )
     }
 
+    /// Starts the service and serves a built web application from `web_root`.
+    pub fn start_with_web_root(
+        serial_path: &str,
+        listener: TcpListener,
+        database_path: &Path,
+        web_root: PathBuf,
+        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
+        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
+    ) -> Result<Self, Error> {
+        let started = Instant::now();
+        Self::start_with_clock_status_and_web_root(
+            serial_path,
+            listener,
+            database_path,
+            StartOptions {
+                web_root: Some(web_root),
+                log_status: None,
+            },
+            utc_unix_ms,
+            move || started.elapsed(),
+            diagnostic,
+        )
+    }
+
+    /// Starts the service and serves a built web application from `web_root`.
+    pub fn start_with_web_root_and_log_status(
+        serial_path: &str,
+        listener: TcpListener,
+        database_path: &Path,
+        web_root: Option<PathBuf>,
+        log_status: logs::LogStatusHandle,
+        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
+        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
+    ) -> Result<Self, Error> {
+        let started = Instant::now();
+        Self::start_with_clock_status_and_web_root(
+            serial_path,
+            listener,
+            database_path,
+            StartOptions {
+                web_root,
+                log_status: Some(log_status),
+            },
+            utc_unix_ms,
+            move || started.elapsed(),
+            diagnostic,
+        )
+    }
+
     /// `elapsed` is a monotonic clock, independent of UTC reception timestamps.
     /// Diagnostic callbacks must remain nonblocking, including operational events.
     pub fn start_with_clock(
@@ -163,6 +218,29 @@ impl Service {
         log_status: Option<logs::LogStatusHandle>,
         utc_unix_ms: impl Fn() -> i64 + Send + 'static,
         elapsed: impl Fn() -> Duration + Send + 'static,
+        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
+    ) -> Result<Self, Error> {
+        Self::start_with_clock_status_and_web_root(
+            serial_path,
+            listener,
+            database_path,
+            StartOptions {
+                web_root: None,
+                log_status,
+            },
+            utc_unix_ms,
+            elapsed,
+            diagnostic,
+        )
+    }
+
+    fn start_with_clock_status_and_web_root(
+        serial_path: &str,
+        listener: TcpListener,
+        database_path: &Path,
+        options: StartOptions,
+        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
+        elapsed: impl Fn() -> Duration + Send + 'static,
         mut diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
     ) -> Result<Self, Error> {
         let serial_path = serial_path.to_owned();
@@ -178,7 +256,8 @@ impl Service {
             Arc::clone(&live),
             history,
             database_status,
-            log_status,
+            options.log_status,
+            options.web_root,
         )?;
         let stopping = Arc::new(AtomicBool::new(false));
         let serial_live = Arc::clone(&live);
