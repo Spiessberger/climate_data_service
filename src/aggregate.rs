@@ -1,3 +1,4 @@
+use crate::hourly::{self, HOUR_MS, HourSummary, ceil_hour, floor_hour, round_hour};
 use crate::storage::{History, StoredReading, Stream, row_to_reading};
 use chrono::{
     DateTime, Datelike, Days, LocalResult, Months, NaiveDate, NaiveTime, Offset, TimeDelta,
@@ -10,9 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const STATION_TIMEZONE: &str = "Europe/Vienna";
 pub(crate) const STALE_AFTER_MS: i64 = 300_000;
-pub(crate) const MAX_SUMMARY_DAYS: i64 = 366;
 pub(crate) const MAX_SUMMARY_POINTS: usize = 600;
-pub(crate) const MAX_INSTANT_DURATION_MS: i64 = (366 * 24 + 1) * 60 * 60 * 1_000;
 const MAX_AGGREGATE_ROWS: usize = 2_000_000;
 const AGGREGATE_TIME_BUDGET: Duration = Duration::from_secs(4);
 const RAIN_COMPLETE_GAP_MS: i64 = 300_000;
@@ -164,41 +163,49 @@ pub(crate) struct SummaryRequest {
 
 impl SummaryRequest {
     pub(crate) fn dates(from_date: NaiveDate, through_date: NaiveDate) -> Option<Self> {
-        let days = through_date.signed_duration_since(from_date).num_days() + 1;
-        if !(1..=MAX_SUMMARY_DAYS).contains(&days) {
+        if through_date < from_date || !supported_date(from_date) || !supported_date(through_date) {
             return None;
         }
         let after_through = through_date.checked_add_days(Days::new(1))?;
-        Some(Self {
+        Self {
             mode: SummaryMode::Dates,
             rain_grouping: RainGrouping::Auto,
             from_date,
             through_date,
             from_unix_ms: local_midnight(from_date),
             to_unix_ms: local_midnight(after_through),
-        })
+        }
+        .within_rain_limit()
     }
 
     pub(crate) fn instants(from_unix_ms: i64, to_unix_ms: i64) -> Option<Self> {
-        let duration = to_unix_ms.checked_sub(from_unix_ms)?;
-        if !(1..=MAX_INSTANT_DURATION_MS).contains(&duration) {
+        if to_unix_ms.checked_sub(from_unix_ms)? < 1 {
             return None;
         }
-        let from_date = station_date(from_unix_ms)?;
-        let through_date = station_date(to_unix_ms.checked_sub(1)?)?;
-        let covered_dates = through_date.signed_duration_since(from_date).num_days() + 1;
-        if !(1..=MAX_SUMMARY_DAYS).contains(&covered_dates) {
-            return None;
-        }
-        Some(Self {
+        let from_date = station_date(from_unix_ms).filter(|date| supported_date(*date))?;
+        let through_date =
+            station_date(to_unix_ms.checked_sub(1)?).filter(|date| supported_date(*date))?;
+        Self {
             mode: SummaryMode::Instants,
             rain_grouping: RainGrouping::Auto,
             from_date,
             through_date,
             from_unix_ms,
             to_unix_ms,
-        })
+        }
+        .within_rain_limit()
     }
+
+    // The range length is otherwise unlimited, but some rain grouping must fit into
+    // the point limit, which caps ranges at 600 calendar months.
+    fn within_rain_limit(self) -> Option<Self> {
+        (calendar_rain_intervals(&self, RainGrouping::Month).len() <= MAX_SUMMARY_POINTS)
+            .then_some(self)
+    }
+}
+
+fn supported_date(date: NaiveDate) -> bool {
+    (1..=9999).contains(&date.year())
 }
 
 #[derive(Default, Serialize)]
@@ -370,19 +377,36 @@ impl Budget {
     }
 }
 
-#[derive(Clone)]
-struct WeatherSample {
+pub(crate) struct WeatherSample {
     received_at_unix_ms: i64,
     station_id: u8,
-    temperature_celsius: Option<f64>,
-    relative_humidity_percent: Option<u8>,
-    wind_speed_mps: Option<f64>,
-    gust_speed_mps: Option<f64>,
+    pub(crate) temperature_celsius: Option<f64>,
+    pub(crate) relative_humidity_percent: Option<u8>,
+    pub(crate) wind_speed_mps: Option<f64>,
+    pub(crate) gust_speed_mps: Option<f64>,
     rain_mm: f64,
 }
 
+impl WeatherSample {
+    pub(crate) fn rain_point(&self) -> RainPoint {
+        RainPoint {
+            received_at_unix_ms: self.received_at_unix_ms,
+            station_id: self.station_id,
+            rain_mm: self.rain_mm,
+        }
+    }
+}
+
+/// The rain counter evidence of one reading.
+#[derive(Clone, Copy)]
+pub(crate) struct RainPoint {
+    pub(crate) received_at_unix_ms: i64,
+    pub(crate) station_id: u8,
+    pub(crate) rain_mm: f64,
+}
+
 #[derive(Default)]
-struct RainAccumulator {
+pub(crate) struct RainAccumulator {
     total_mm: f64,
     comparable_pairs: usize,
     excluded_transitions: usize,
@@ -392,12 +416,15 @@ struct RainAccumulator {
 }
 
 impl RainAccumulator {
-    fn observe(&mut self, previous: Option<&WeatherSample>, current: &WeatherSample) {
+    fn observe(&mut self, previous: Option<RainPoint>, current: RainPoint) {
         self.last_observation_ms = Some(current.received_at_unix_ms);
-        let Some(previous) = previous else {
-            self.incomplete = true;
-            return;
-        };
+        match previous {
+            Some(previous) => self.pair(previous, current),
+            None => self.incomplete = true,
+        }
+    }
+
+    pub(crate) fn pair(&mut self, previous: RainPoint, current: RainPoint) {
         let gap = current.received_at_unix_ms - previous.received_at_unix_ms;
         self.largest_gap_ms = Some(self.largest_gap_ms.map_or(gap, |largest| largest.max(gap)));
         if gap > RAIN_COMPLETE_GAP_MS {
@@ -411,6 +438,47 @@ impl RainAccumulator {
             self.total_mm += delta;
             self.comparable_pairs += 1;
         }
+    }
+
+    /// Observes an hour as its first reading followed by its pre-aggregated pairs,
+    /// which is equivalent to observing each of its readings in order.
+    fn observe_hour(&mut self, previous: Option<RainPoint>, hour: &HourSummary) {
+        self.observe(previous, hour.first);
+        let pairs = &hour.rain;
+        self.total_mm += pairs.total_mm;
+        self.comparable_pairs += pairs.comparable_pairs;
+        self.excluded_transitions += pairs.excluded_transitions;
+        self.incomplete |= pairs.incomplete;
+        if let Some(gap) = pairs.largest_gap_ms {
+            self.largest_gap_ms = Some(self.largest_gap_ms.map_or(gap, |largest| largest.max(gap)));
+        }
+        self.last_observation_ms = Some(hour.last.received_at_unix_ms);
+    }
+
+    pub(crate) fn from_pairs(
+        total_mm: f64,
+        comparable_pairs: usize,
+        excluded_transitions: usize,
+        largest_gap_ms: Option<i64>,
+    ) -> Self {
+        Self {
+            total_mm,
+            comparable_pairs,
+            excluded_transitions,
+            largest_gap_ms,
+            incomplete: excluded_transitions > 0
+                || largest_gap_ms.is_some_and(|gap| gap > RAIN_COMPLETE_GAP_MS),
+            last_observation_ms: None,
+        }
+    }
+
+    pub(crate) fn pair_totals(&self) -> (f64, usize, usize, Option<i64>) {
+        (
+            self.total_mm,
+            self.comparable_pairs,
+            self.excluded_transitions,
+            self.largest_gap_ms,
+        )
     }
 
     fn finish(mut self, to_unix_ms: i64) -> Rain {
@@ -447,20 +515,31 @@ impl RainAccumulator {
 }
 
 #[derive(Default)]
-struct Values {
-    count: usize,
-    sum: f64,
-    min: Option<f64>,
-    max: Option<f64>,
+pub(crate) struct Values {
+    pub(crate) count: usize,
+    pub(crate) sum: f64,
+    pub(crate) min: Option<f64>,
+    pub(crate) max: Option<f64>,
 }
 
 impl Values {
-    fn add(&mut self, value: Option<f64>) {
+    pub(crate) fn add(&mut self, value: Option<f64>) {
         let Some(value) = value else { return };
         self.count += 1;
         self.sum += value;
         self.min = Some(self.min.map_or(value, |current| current.min(value)));
         self.max = Some(self.max.map_or(value, |current| current.max(value)));
+    }
+
+    fn merge(&mut self, other: &Values) {
+        self.count += other.count;
+        self.sum += other.sum;
+        if let Some(min) = other.min {
+            self.min = Some(self.min.map_or(min, |current| current.min(min)));
+        }
+        if let Some(max) = other.max {
+            self.max = Some(self.max.map_or(max, |current| current.max(max)));
+        }
     }
 
     fn average(&self) -> Option<f64> {
@@ -495,6 +574,79 @@ struct BucketAccumulator {
     rain: RainAccumulator,
 }
 
+impl BucketAccumulator {
+    fn add_sample(&mut self, previous: Option<RainPoint>, sample: &WeatherSample) {
+        self.sample_count += 1;
+        self.temperature.add(sample.temperature_celsius);
+        self.humidity
+            .add(sample.relative_humidity_percent.map(f64::from));
+        self.wind.add(sample.wind_speed_mps);
+        self.gust.add(sample.gust_speed_mps);
+        self.rain.observe(previous, sample.rain_point());
+    }
+
+    fn add_hour(&mut self, previous: Option<RainPoint>, hour: &HourSummary) {
+        self.sample_count += hour.sample_count;
+        self.temperature.merge(&hour.temperature);
+        self.humidity.merge(&hour.humidity);
+        self.wind.merge(&hour.wind);
+        self.gust.merge(&hour.gust);
+        self.rain.observe_hour(previous, hour);
+    }
+}
+
+/// Accumulates readings, or whole hours of them, in reception order into the
+/// overall statistics, chart buckets and rain periods.
+struct SummaryFold {
+    previous: Option<RainPoint>,
+    overall: BucketAccumulator,
+    boundaries: Vec<i64>,
+    buckets: Vec<BucketAccumulator>,
+    rain_ends: Vec<i64>,
+    rainfall: Vec<RainAccumulator>,
+}
+
+impl SummaryFold {
+    fn bucket(&self, time: i64) -> usize {
+        self.boundaries
+            .partition_point(|&boundary| boundary <= time)
+            - 1
+    }
+
+    fn rain_period(&self, time: i64) -> usize {
+        self.rain_ends
+            .partition_point(|&end| end <= time)
+            .min(self.rain_ends.len() - 1)
+    }
+
+    fn sample(&mut self, sample: &WeatherSample) {
+        let time = sample.received_at_unix_ms;
+        let (bucket, rain_period) = (self.bucket(time), self.rain_period(time));
+        self.overall.add_sample(self.previous, sample);
+        self.buckets[bucket].add_sample(self.previous, sample);
+        self.rainfall[rain_period].observe(self.previous, sample.rain_point());
+        self.previous = Some(sample.rain_point());
+    }
+
+    /// Whether the hour lies inside the range, one chart bucket and one rain period.
+    fn takes_whole_hour(&self, hour: i64) -> bool {
+        let last = hour + HOUR_MS - 1;
+        self.boundaries[0] <= hour
+            && last < self.boundaries[self.boundaries.len() - 1]
+            && self.bucket(hour) == self.bucket(last)
+            && self.rain_period(hour) == self.rain_period(last)
+    }
+
+    fn hour(&mut self, hour: &HourSummary) {
+        let time = hour.hour_start_unix_ms;
+        let (bucket, rain_period) = (self.bucket(time), self.rain_period(time));
+        self.overall.add_hour(self.previous, hour);
+        self.buckets[bucket].add_hour(self.previous, hour);
+        self.rainfall[rain_period].observe_hour(self.previous, hour);
+        self.previous = Some(hour.last);
+    }
+}
+
 impl History {
     pub(crate) fn dashboard(&self, now: i64) -> Result<Dashboard, AggregateError> {
         let mut connection = read_connection(&self.path)?;
@@ -507,12 +659,11 @@ impl History {
         let weather_extent = extent(&transaction, "weather_readings")?;
         let indoor_extent = extent(&transaction, "indoor_readings")?;
         let rain_from = now.saturating_sub(24 * 60 * 60 * 1_000);
-        let rain_predecessor = weather_predecessor(&transaction, rain_from)?;
         let mut rain = RainAccumulator::default();
-        let mut previous = rain_predecessor;
+        let mut previous = weather_predecessor(&transaction, rain_from)?;
         scan_weather(&transaction, rain_from, now, &mut budget, |sample| {
-            rain.observe(previous.as_ref(), sample);
-            previous = Some(sample.clone());
+            rain.observe(previous, sample.rain_point());
+            previous = Some(sample.rain_point());
         })?;
         let (night_from, night_to, night_state) = night_range(now);
         let mut minimum: Option<f64> = None;
@@ -552,16 +703,20 @@ impl History {
         request: SummaryRequest,
         max_points: usize,
     ) -> Result<WeatherSummary, AggregateError> {
+        self.summarize(request, max_points, true)
+    }
+
+    fn summarize(
+        &self,
+        request: SummaryRequest,
+        max_points: usize,
+        allow_hourly: bool,
+    ) -> Result<WeatherSummary, AggregateError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
         let (rain_grouping, available_rain_groupings, rain_intervals) = rain_intervals(&request);
-        let mut rainfall = rain_intervals
-            .iter()
-            .map(|_| RainAccumulator::default())
-            .collect::<Vec<_>>();
-        let mut rain_index = 0;
         let SummaryRequest {
             mode,
             rain_grouping: _,
@@ -570,49 +725,74 @@ impl History {
             from_unix_ms,
             to_unix_ms,
         } = request;
+        let (boundaries, hourly_buckets) = bucket_boundaries(from_unix_ms, to_unix_ms, max_points);
         let mut connection = read_connection(&self.path)?;
         let transaction = connection.transaction()?;
         let mut budget = Budget::new();
-        // Establish one read snapshot before loading the predecessor and range.
-        let predecessor = weather_predecessor(&transaction, from_unix_ms)?;
-        let mut overall = BucketAccumulator::default();
-        let duration = to_unix_ms - from_unix_ms;
-        let bucket_count = if duration < max_points as i64 {
-            duration as usize
-        } else {
-            max_points
+        // Establish one read snapshot before checking summary progress and loading
+        // the predecessor and range.
+        let use_hourly = allow_hourly && hourly_buckets && hourly::complete(&transaction)?;
+        let mut fold = SummaryFold {
+            previous: weather_predecessor(&transaction, from_unix_ms)?,
+            overall: BucketAccumulator::default(),
+            buckets: (1..boundaries.len())
+                .map(|_| BucketAccumulator::default())
+                .collect(),
+            boundaries,
+            rain_ends: rain_intervals.iter().map(|interval| interval.1).collect(),
+            rainfall: rain_intervals
+                .iter()
+                .map(|_| RainAccumulator::default())
+                .collect(),
         };
-        let mut buckets = (0..bucket_count)
-            .map(|_| BucketAccumulator::default())
-            .collect::<Vec<_>>();
-        let mut previous = predecessor;
-        scan_weather(
-            &transaction,
-            from_unix_ms,
-            to_unix_ms,
-            &mut budget,
-            |sample| {
-                overall.sample_count += 1;
-                add_values(&mut overall, sample);
-                overall.rain.observe(previous.as_ref(), sample);
-                let offset = sample.received_at_unix_ms - from_unix_ms;
-                let index = ((((offset + 1) as i128 * bucket_count as i128) - 1) / duration as i128)
-                    as usize;
-                let bucket = &mut buckets[index.min(bucket_count - 1)];
-                bucket.sample_count += 1;
-                add_values(bucket, sample);
-                bucket.rain.observe(previous.as_ref(), sample);
-                while rain_index + 1 < rain_intervals.len()
-                    && sample.received_at_unix_ms >= rain_intervals[rain_index].1
-                {
-                    rain_index += 1;
+        let (hours_from, hours_to) = (ceil_hour(from_unix_ms), floor_hour(to_unix_ms));
+        if use_hourly && hours_from < hours_to {
+            // Partial edge hours and hours split by a bucket or rain period boundary
+            // are read from raw readings; every other hour comes from its summary.
+            scan_weather(
+                &transaction,
+                from_unix_ms,
+                hours_from,
+                &mut budget,
+                |sample| fold.sample(sample),
+            )?;
+            hourly::for_each(&transaction, hours_from, hours_to, |hour| {
+                budget.row()?;
+                let start = hour.hour_start_unix_ms;
+                if fold.takes_whole_hour(start) {
+                    fold.hour(&hour);
+                    Ok(())
+                } else {
+                    scan_weather(
+                        &transaction,
+                        start,
+                        start + HOUR_MS,
+                        &mut budget,
+                        |sample| fold.sample(sample),
+                    )
                 }
-                rainfall[rain_index].observe(previous.as_ref(), sample);
-                previous = Some(sample.clone());
-            },
-        )?;
+            })?;
+            scan_weather(&transaction, hours_to, to_unix_ms, &mut budget, |sample| {
+                fold.sample(sample)
+            })?;
+        } else {
+            scan_weather(
+                &transaction,
+                from_unix_ms,
+                to_unix_ms,
+                &mut budget,
+                |sample| fold.sample(sample),
+            )?;
+        }
         transaction.commit()?;
 
+        let SummaryFold {
+            overall,
+            boundaries,
+            buckets,
+            rainfall,
+            ..
+        } = fold;
         let sample_count = overall.sample_count;
         let statistics = SummaryStatistics {
             temperature_celsius: overall.temperature.min_max_average(),
@@ -624,10 +804,10 @@ impl History {
         };
         let buckets = buckets
             .into_iter()
-            .enumerate()
-            .map(|(index, bucket)| SummaryBucket {
-                from_unix_ms: bucket_boundary(from_unix_ms, duration, index, bucket_count),
-                to_unix_ms: bucket_boundary(from_unix_ms, duration, index + 1, bucket_count),
+            .zip(boundaries.windows(2))
+            .map(|(bucket, bounds)| SummaryBucket {
+                from_unix_ms: bounds[0],
+                to_unix_ms: bounds[1],
                 sample_count: bucket.sample_count,
                 temperature_celsius: bucket.temperature.min_max_average(),
                 relative_humidity_percent: Average {
@@ -637,12 +817,7 @@ impl History {
                 gust_speed_mps: Maximum {
                     max: bucket.gust.max,
                 },
-                rain: bucket.rain.finish(bucket_boundary(
-                    from_unix_ms,
-                    duration,
-                    index + 1,
-                    bucket_count,
-                )),
+                rain: bucket.rain.finish(bounds[1]),
             })
             .collect();
         Ok(WeatherSummary {
@@ -676,6 +851,18 @@ impl History {
                 })
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+impl History {
+    /// The summary computed from raw readings only, for comparison in tests.
+    pub(crate) fn raw_weather_summary(
+        &self,
+        request: SummaryRequest,
+        max_points: usize,
+    ) -> Result<WeatherSummary, AggregateError> {
+        self.summarize(request, max_points, false)
     }
 }
 
@@ -723,7 +910,7 @@ fn extent(transaction: &Transaction<'_>, table: &str) -> rusqlite::Result<Option
 fn weather_predecessor(
     transaction: &Transaction<'_>,
     from_unix_ms: i64,
-) -> rusqlite::Result<Option<WeatherSample>> {
+) -> rusqlite::Result<Option<RainPoint>> {
     transaction
         .query_row(
             "SELECT received_at_unix_ms, station_id, temperature_celsius,
@@ -736,6 +923,7 @@ fn weather_predecessor(
             weather_sample,
         )
         .optional()
+        .map(|sample| sample.map(|sample| sample.rain_point()))
 }
 
 fn scan_weather(
@@ -745,7 +933,21 @@ fn scan_weather(
     budget: &mut Budget,
     mut observe: impl FnMut(&WeatherSample),
 ) -> Result<(), AggregateError> {
-    let mut statement = transaction.prepare(
+    weather_samples(transaction, from_unix_ms, to_unix_ms, |sample| {
+        budget.row()?;
+        observe(sample);
+        Ok(())
+    })
+}
+
+/// Visits the readings received in `[from_unix_ms, to_unix_ms)` in reception order.
+pub(crate) fn weather_samples<E: From<rusqlite::Error>>(
+    connection: &Connection,
+    from_unix_ms: i64,
+    to_unix_ms: i64,
+    mut observe: impl FnMut(&WeatherSample) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut statement = connection.prepare_cached(
         "SELECT received_at_unix_ms, station_id, temperature_celsius,
                 relative_humidity_percent, wind_speed_mps, gust_speed_mps, rain_mm
          FROM weather_readings
@@ -754,9 +956,7 @@ fn scan_weather(
     )?;
     let mut rows = statement.query(params![from_unix_ms, to_unix_ms])?;
     while let Some(row) = rows.next()? {
-        budget.row()?;
-        let sample = weather_sample(row)?;
-        observe(&sample);
+        observe(&weather_sample(row)?)?;
     }
     Ok(())
 }
@@ -771,15 +971,6 @@ fn weather_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<WeatherSample> {
         gust_speed_mps: row.get(5)?,
         rain_mm: row.get(6)?,
     })
-}
-
-fn add_values(accumulator: &mut BucketAccumulator, sample: &WeatherSample) {
-    accumulator.temperature.add(sample.temperature_celsius);
-    accumulator
-        .humidity
-        .add(sample.relative_humidity_percent.map(f64::from));
-    accumulator.wind.add(sample.wind_speed_mps);
-    accumulator.gust.add(sample.gust_speed_mps);
 }
 
 fn night_range(now_unix_ms: i64) -> (i64, i64, NightState) {
@@ -822,30 +1013,51 @@ fn station_date(unix_ms: i64) -> Option<NaiveDate> {
         .map(|local| local.date())
 }
 
+// A local time skipped by a daylight-saving gap (such as Vienna midnight on
+// 1980-04-06) resolves to the end of the gap, where the local day actually began.
 fn local_time(date: NaiveDate, time: NaiveTime) -> i64 {
-    match Vienna.from_local_datetime(&date.and_time(time)) {
-        LocalResult::Single(value) => value.timestamp_millis(),
-        LocalResult::Ambiguous(earlier, _) => earlier.timestamp_millis(),
-        LocalResult::None => unreachable!("Vienna 00:00, 06:00 and 18:00 always exist"),
-    }
+    let local = date.and_time(time);
+    (0..=24 * 60)
+        .find_map(|minutes| {
+            match Vienna.from_local_datetime(&(local + TimeDelta::minutes(minutes))) {
+                LocalResult::Single(value) | LocalResult::Ambiguous(value, _) => {
+                    Some(value.timestamp_millis())
+                }
+                LocalResult::None => None,
+            }
+        })
+        .expect("Vienna daylight-saving gaps are shorter than a day")
 }
 
-fn bucket_boundary(from: i64, duration: i64, index: usize, count: usize) -> i64 {
-    from + ((duration as i128 * index as i128) / count as i128) as i64
+/// Chart bucket boundaries, `count + 1` values from `from` through `to`. Buckets are
+/// equally wide, except that buckets of at least an hour have their inner
+/// boundaries rounded to whole UTC hours so they can be built from hourly summaries.
+/// Returns whether the boundaries were rounded.
+fn bucket_boundaries(from: i64, to: i64, max_points: usize) -> (Vec<i64>, bool) {
+    let duration = to - from;
+    let count = max_points.min(usize::try_from(duration).unwrap_or(usize::MAX));
+    let hourly = duration / count as i64 >= HOUR_MS;
+    let boundaries = (0..=count)
+        .map(|index| {
+            let boundary = from + ((duration as i128 * index as i128) / count as i128) as i64;
+            if hourly && 0 < index && index < count {
+                round_hour(boundary)
+            } else {
+                boundary
+            }
+        })
+        .collect();
+    (boundaries, hourly)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample(time: i64, station: u8, rain: f64) -> WeatherSample {
-        WeatherSample {
+    fn sample(time: i64, station: u8, rain: f64) -> RainPoint {
+        RainPoint {
             received_at_unix_ms: time,
             station_id: station,
-            temperature_celsius: None,
-            relative_humidity_percent: None,
-            wind_speed_mps: None,
-            gust_speed_mps: None,
             rain_mm: rain,
         }
     }
@@ -855,7 +1067,7 @@ mod tests {
         let previous = sample(0, 1, 5.0);
         let current = sample(60_000, 1, 5.0);
         let mut flat = RainAccumulator::default();
-        flat.observe(Some(&previous), &current);
+        flat.observe(Some(previous), current);
         let flat = flat.finish(120_000);
         assert_eq!(flat.total_mm, Some(0.0));
         assert!(matches!(flat.coverage, RainCoverage::Complete));
@@ -863,15 +1075,15 @@ mod tests {
         let reset = sample(60_000, 1, 1.0);
         let after_reset = sample(120_000, 1, 1.5);
         let mut partial = RainAccumulator::default();
-        partial.observe(Some(&previous), &reset);
-        partial.observe(Some(&reset), &after_reset);
+        partial.observe(Some(previous), reset);
+        partial.observe(Some(reset), after_reset);
         let partial = partial.finish(180_000);
         assert_eq!(partial.total_mm, Some(0.5));
         assert_eq!(partial.excluded_transitions, 1);
         assert!(matches!(partial.coverage, RainCoverage::Partial));
 
         let mut trailing = RainAccumulator::default();
-        trailing.observe(Some(&previous), &current);
+        trailing.observe(Some(previous), current);
         let trailing = trailing.finish(400_001);
         assert!(matches!(trailing.coverage, RainCoverage::Partial));
         assert_eq!(trailing.largest_gap_ms, Some(340_001));
@@ -902,22 +1114,60 @@ mod tests {
     }
 
     #[test]
-    fn instant_ranges_reject_more_than_366_containing_station_dates() {
-        let from = local_time(
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            NaiveTime::from_hms_opt(23, 59, 0).unwrap(),
-        );
-        let to = local_time(
-            NaiveDate::from_ymd_opt(2027, 1, 2).unwrap(),
-            NaiveTime::from_hms_opt(0, 1, 0).unwrap(),
-        );
-        assert!(to - from < MAX_INSTANT_DURATION_MS);
-        assert!(SummaryRequest::instants(from, to).is_none());
+    fn ranges_are_limited_only_by_monthly_rain_buckets_and_supported_years() {
+        let date = |value: &str| value.parse::<NaiveDate>().unwrap();
+        assert!(SummaryRequest::dates(date("2000-01-01"), date("2049-12-31")).is_some());
+        assert!(SummaryRequest::dates(date("2000-01-01"), date("2050-01-01")).is_none());
+        let from = local_midnight(date("2000-01-01"));
+        let to = local_midnight(date("2050-01-01"));
+        assert!(SummaryRequest::instants(from, to).is_some());
+        assert!(SummaryRequest::instants(from, to + 1).is_none());
+        assert!(SummaryRequest::dates(date("0000-12-31"), date("0001-01-01")).is_none());
         assert!(SummaryRequest::instants(i64::MAX - 1, i64::MAX).is_none());
         let maximum_utc = DateTime::<Utc>::MAX_UTC.timestamp_millis();
         assert!(station_date(maximum_utc).is_none());
         assert!(SummaryRequest::instants(maximum_utc - 1, maximum_utc).is_none());
     }
+
+    #[test]
+    fn local_midnight_skipped_by_daylight_saving_starts_at_the_gap_end() {
+        // Vienna moved from 00:00 CET to 01:00 CEST on 1980-04-06.
+        let midnight = local_midnight("1980-04-06".parse().unwrap());
+        assert_eq!(
+            DateTime::from_timestamp_millis(midnight).unwrap(),
+            "1980-04-05T23:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert!(
+            SummaryRequest::dates("1980-04-06".parse().unwrap(), "1980-04-06".parse().unwrap())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn long_range_buckets_snap_inner_boundaries_to_whole_hours() {
+        let from = local_midnight("2026-01-01".parse().unwrap()) + 123;
+        let to = local_midnight("2026-02-01".parse().unwrap()) - 456;
+        let (boundaries, hourly) = bucket_boundaries(from, to, 360);
+        assert!(hourly);
+        assert_eq!(boundaries.len(), 361);
+        assert_eq!((boundaries[0], boundaries[360]), (from, to));
+        assert!(boundaries[1..360].iter().all(|b| b % HOUR_MS == 0));
+        assert!(
+            boundaries
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= HOUR_MS / 2)
+        );
+        assert!(
+            boundaries[1..360]
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= HOUR_MS)
+        );
+
+        let (short, hourly) = bucket_boundaries(from, from + 360 * HOUR_MS - 1, 360);
+        assert!(!hourly);
+        assert_eq!(short[1] - short[0], HOUR_MS - 1);
+    }
+
     fn date_request(from: &str, through: &str, grouping: RainGrouping) -> SummaryRequest {
         let mut request =
             SummaryRequest::dates(from.parse().unwrap(), through.parse().unwrap()).unwrap();

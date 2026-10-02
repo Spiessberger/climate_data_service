@@ -275,6 +275,8 @@ fn sqlite_schema_and_runtime_preserve_the_required_metadata() {
             ("sqlite_version", rusqlite::version()),
             ("synchronous", "2"),
             ("wal_autocheckpoint", "1000"),
+            ("weather_hourly_through_id", "0"),
+            ("weather_hourly_version", "1"),
         ]
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
     );

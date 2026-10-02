@@ -21,7 +21,10 @@ struct Demo {
 
 impl Demo {
     fn start(web_root: Option<std::path::PathBuf>) -> Self {
-        let directory = Arc::new(tempfile::tempdir().unwrap());
+        Self::start_in(Arc::new(tempfile::tempdir().unwrap()), web_root)
+    }
+
+    fn start_in(directory: Arc<TempDir>, web_root: Option<std::path::PathBuf>) -> Self {
         let database_path = directory.path().join("climate.sqlite3");
         let (master, slave) = TTYPort::pair().unwrap();
         let serial_path = slave.name().unwrap();
@@ -223,10 +226,15 @@ fn summary_normalizes_vienna_dates_and_keeps_nulls_separate_from_zero() {
         "/api/v1/history/weather/summary?from_date=2026-09-24&through_date=2026-09-23",
         "/api/v1/history/weather/summary?from_date=2026-09-23&through_date=2026-09-23&max_points=0",
         "/api/v1/history/weather/summary?from_date=2026-09-23&through_date=2026-09-23&max_points=601",
-        "/api/v1/history/weather/summary?from_date=2025-01-01&through_date=2026-09-23",
+        "/api/v1/history/weather/summary?from_date=2000-01-01&through_date=2050-01-01",
     ] {
         assert_eq!(demo.json(path).0, 422, "{path}");
     }
+    let (status, multi_year) =
+        demo.json("/api/v1/history/weather/summary?from_date=2000-01-01&through_date=2049-12-31");
+    assert_eq!(status, 200, "{multi_year}");
+    assert_eq!(multi_year["rain_grouping"], "month");
+    assert_eq!(multi_year["rain_buckets"].as_array().unwrap().len(), 600);
 
     let (status, spring) = demo.json(
         "/api/v1/history/weather/summary?from_date=2026-03-29&through_date=2026-03-29&max_points=1",
@@ -328,7 +336,8 @@ fn instant_summary_validates_mode_bounds_and_vienna_date_metadata() {
         "/api/v1/history/weather/summary?from_unix_ms=2&to_unix_ms=1",
         "/api/v1/history/weather/summary?from_date=2026-09-23&through_date=2026-09-23&from_unix_ms=0&to_unix_ms=1",
         "/api/v1/history/weather/summary?from_unix_ms=9223372036854775806&to_unix_ms=9223372036854775807",
-        "/api/v1/history/weather/summary?from_unix_ms=0&to_unix_ms=31626000001",
+        // 1970-01 through 2020-01 would need 601 monthly rain buckets.
+        "/api/v1/history/weather/summary?from_unix_ms=0&to_unix_ms=1577836800000",
     ] {
         assert_eq!(demo.json(path).0, 422, "{path}");
     }
@@ -491,4 +500,93 @@ fn current_rain_period_is_so_far_and_future_periods_are_unavailable() {
     );
     let future = buckets.iter().find(|b| b["future"] == true).unwrap();
     assert!(future["rain"]["total_mm"].is_null());
+}
+
+#[test]
+fn existing_readings_are_backfilled_into_hourly_summaries_for_long_ranges() {
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let database_path = Demo::start_in(Arc::clone(&directory), None).database_path;
+    // 2026-09-01 local midnight; one reading every ten minutes for 30 days.
+    let from = 1_788_213_600_000_i64;
+    let readings = 30 * 144;
+    let connection = Connection::open(&database_path).unwrap();
+    connection.execute_batch("BEGIN").unwrap();
+    for index in 0..readings {
+        insert_weather(
+            &connection,
+            from + index * 600_000,
+            (
+                1,
+                Some((index % 144) as f64 / 10.0),
+                Some(50),
+                Some(1.0),
+                Some(2.0),
+                index as f64 / 10.0,
+            ),
+        );
+    }
+    connection.execute_batch("COMMIT").unwrap();
+
+    let demo = Demo::start_in(directory, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let summarized = || -> (String, i64) {
+        connection
+            .query_row(
+                "SELECT (SELECT value FROM service_metadata WHERE key = 'weather_hourly_through_id'),
+                        (SELECT COUNT(*) FROM weather_hourly)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    while summarized().0 != readings.to_string() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "backfill did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(summarized().1, 30 * 24);
+
+    let (status, body) = demo.json(
+        "/api/v1/history/weather/summary?from_date=2026-09-01&through_date=2026-09-30&max_points=30",
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sample_count"], readings);
+    let statistics = &body["statistics"];
+    assert_eq!(statistics["temperature_celsius"]["min"], 0.0);
+    assert_eq!(statistics["temperature_celsius"]["max"], 14.3);
+    assert!(
+        (statistics["temperature_celsius"]["average"]
+            .as_f64()
+            .unwrap()
+            - 7.15)
+            .abs()
+            < 1e-9
+    );
+    assert!((statistics["rain"]["total_mm"].as_f64().unwrap() - 431.9).abs() < 1e-6);
+    assert_eq!(statistics["rain"]["coverage"], "partial");
+    let buckets = body["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 30);
+    for (index, bucket) in buckets.iter().enumerate() {
+        assert_eq!(bucket["from_unix_ms"], from + index as i64 * 86_400_000);
+        assert_eq!(bucket["sample_count"], 144);
+    }
+
+    // Exact ranges over an hour per bucket snap inner bucket boundaries to whole hours.
+    let (status, body) = demo.json(&format!(
+        "/api/v1/history/weather/summary?from_unix_ms={}&to_unix_ms={}&max_points=360",
+        from + 1_234,
+        from + 30 * 86_400_000 - 5_678
+    ));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["sample_count"], readings - 1);
+    let buckets = body["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 360);
+    assert_eq!(buckets[0]["from_unix_ms"], from + 1_234);
+    assert_eq!(buckets[359]["to_unix_ms"], from + 30 * 86_400_000 - 5_678);
+    for pair in buckets.windows(2) {
+        assert_eq!(pair[0]["to_unix_ms"], pair[1]["from_unix_ms"]);
+        assert_eq!(pair[1]["from_unix_ms"].as_i64().unwrap() % 3_600_000, 0);
+    }
 }

@@ -1,4 +1,4 @@
-use crate::{ClimateReading, LiveIndoorReading, LiveWeatherReading};
+use crate::{ClimateReading, LiveIndoorReading, LiveWeatherReading, hourly};
 use log::{debug, error, info, warn};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
@@ -17,6 +17,7 @@ const MINIMUM_SQLITE_VERSION: i32 = 3_051_003;
 const STORAGE_QUEUE_CAPACITY: usize = 256;
 const STORAGE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const STORAGE_WRITE_ATTEMPTS: usize = 3;
+const HOURLY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const INDOOR_COLUMNS: &str = "id, received_at_unix_ms, v, type, boot_id, seq, \
                               temperature_celsius, relative_humidity_percent";
 
@@ -111,12 +112,23 @@ impl Storage {
         let thread = thread::spawn(move || {
             let mut connection = initial_connection;
             let mut retry_at = Instant::now();
+            let mut backfill = Backfill::default();
             loop {
                 if connection.is_none() && Instant::now() >= retry_at {
                     connection = reopen_database(&worker_path, &worker_status);
                     retry_at = Instant::now() + STORAGE_RETRY_INTERVAL;
+                    backfill = Backfill::default();
                 }
-                match receiver.recv_timeout(Duration::from_millis(100)) {
+                // While summaries are behind, keep backfilling between arrivals.
+                let wait = if connection.is_some() {
+                    backfill
+                        .next_step
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(100))
+                } else {
+                    Duration::from_millis(100)
+                };
+                match receiver.recv_timeout(wait) {
                     Ok(reading) => {
                         let Some(mut current) = connection.take() else {
                             let (stream, seq) = reading.describe();
@@ -134,7 +146,13 @@ impl Storage {
                             }
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(current) = connection.as_mut()
+                            && Instant::now() >= backfill.next_step
+                        {
+                            backfill.step(current);
+                        }
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -171,7 +189,7 @@ impl Storage {
     }
 }
 
-fn open_database(path: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_database(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -248,14 +266,61 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
         ("synchronous", synchronous.to_string()),
         ("wal_autocheckpoint", wal_autocheckpoint.to_string()),
     ] {
-        metadata.execute(
-            "INSERT INTO service_metadata (key, value) VALUES (?1, ?2)
-             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
+        hourly::set_metadata(&metadata, key, &value)?;
     }
     metadata.commit()?;
+    hourly::prepare(&mut connection)?;
     Ok(connection)
+}
+
+/// Builds hourly weather summaries for stored readings they do not include yet:
+/// all existing readings after an upgrade, readings written by other processes, or a
+/// reading whose summary update failed. Summary failures never affect live storage.
+struct Backfill {
+    next_step: Instant,
+    started: Option<Instant>,
+}
+
+impl Default for Backfill {
+    fn default() -> Self {
+        Self {
+            next_step: Instant::now(),
+            started: None,
+        }
+    }
+}
+
+impl Backfill {
+    fn step(&mut self, connection: &mut Connection) {
+        match self.try_step(connection) {
+            Ok(true) => {
+                if let Some(started) = self.started.take() {
+                    info!(
+                        "Hourly weather summaries complete after {:.1?}",
+                        started.elapsed()
+                    );
+                }
+                self.next_step = Instant::now() + HOURLY_CHECK_INTERVAL;
+            }
+            Ok(false) => self.next_step = Instant::now(),
+            Err(error) => {
+                warn!("Building hourly weather summaries failed: {error}; retrying");
+                self.next_step = Instant::now() + STORAGE_RETRY_INTERVAL;
+            }
+        }
+    }
+
+    fn try_step(&mut self, connection: &mut Connection) -> rusqlite::Result<bool> {
+        let pending = hourly::pending(connection)?;
+        if pending == 0 {
+            return Ok(true);
+        }
+        if self.started.is_none() {
+            info!("Building hourly weather summaries for {pending} stored readings");
+            self.started = Some(Instant::now());
+        }
+        hourly::backfill_step(connection)
+    }
 }
 
 fn reopen_database(path: &Path, status: &DatabaseStatusHandle) -> Option<Connection> {
@@ -299,7 +364,7 @@ fn mark_failed(status: &DatabaseStatusHandle, error: &impl std::fmt::Display) {
     status.last_error = Some(error);
 }
 
-enum WriteError {
+pub(crate) enum WriteError {
     Retryable(rusqlite::Error),
     Failed(rusqlite::Error),
 }
@@ -313,7 +378,10 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-fn store_reading(connection: &mut Connection, reading: &ClimateReading) -> Result<(), WriteError> {
+pub(crate) fn store_reading(
+    connection: &mut Connection,
+    reading: &ClimateReading,
+) -> Result<(), WriteError> {
     let (stream, seq) = reading.describe();
     for attempt in 0..STORAGE_WRITE_ATTEMPTS {
         match store_attempt(connection, reading) {
@@ -335,7 +403,7 @@ fn store_reading(connection: &mut Connection, reading: &ClimateReading) -> Resul
 }
 
 fn store_attempt(connection: &mut Connection, reading: &ClimateReading) -> Result<i64, WriteError> {
-    let transaction = connection.transaction().map_err(WriteError::Retryable)?;
+    let mut transaction = connection.transaction().map_err(WriteError::Retryable)?;
     let result = match reading {
         ClimateReading::Indoor(reading) => transaction.execute(
             "INSERT INTO indoor_readings (
@@ -352,8 +420,21 @@ fn store_attempt(connection: &mut Connection, reading: &ClimateReading) -> Resul
                 reading.reading.relative_humidity_percent,
             ],
         ),
-        ClimateReading::Weather(reading) => transaction.execute(
-            "INSERT INTO weather_readings (
+        ClimateReading::Weather(reading) => store_weather(&mut transaction, reading),
+    };
+    result.map_err(WriteError::Retryable)?;
+    let id = transaction.last_insert_rowid();
+    transaction.commit().map_err(WriteError::Failed)?;
+    Ok(id)
+}
+
+fn store_weather(
+    transaction: &mut rusqlite::Transaction<'_>,
+    reading: &LiveWeatherReading,
+) -> rusqlite::Result<usize> {
+    let summaries_complete = hourly::complete(transaction)?;
+    let inserted = transaction.execute(
+        "INSERT INTO weather_readings (
                 received_at_unix_ms, v, type, boot_id, seq, station_id,
                 temperature_celsius, relative_humidity_percent,
                 wind_direction_degrees, wind_speed_mps, gust_speed_mps,
@@ -361,32 +442,37 @@ fn store_attempt(connection: &mut Connection, reading: &ClimateReading) -> Resul
                 battery_low, rssi_dbm, lqi
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                       ?13, ?14, ?15, ?16, ?17, ?18)",
-            params![
-                reading.received_at_unix_ms,
-                reading.reading.v,
-                reading.reading.record_type,
-                reading.reading.boot_id,
-                reading.reading.seq,
-                reading.reading.station_id,
-                reading.reading.temperature_celsius,
-                reading.reading.relative_humidity_percent,
-                reading.reading.wind_direction_degrees,
-                reading.reading.wind_speed_mps,
-                reading.reading.gust_speed_mps,
-                reading.reading.rain_mm,
-                reading.reading.uv_microwatts_per_cm2,
-                reading.reading.uv_index,
-                reading.reading.light_lux,
-                reading.reading.battery_low,
-                reading.reading.rssi_dbm,
-                reading.reading.lqi,
-            ],
-        ),
-    };
-    result.map_err(WriteError::Retryable)?;
-    let id = transaction.last_insert_rowid();
-    transaction.commit().map_err(WriteError::Failed)?;
-    Ok(id)
+        params![
+            reading.received_at_unix_ms,
+            reading.reading.v,
+            reading.reading.record_type,
+            reading.reading.boot_id,
+            reading.reading.seq,
+            reading.reading.station_id,
+            reading.reading.temperature_celsius,
+            reading.reading.relative_humidity_percent,
+            reading.reading.wind_direction_degrees,
+            reading.reading.wind_speed_mps,
+            reading.reading.gust_speed_mps,
+            reading.reading.rain_mm,
+            reading.reading.uv_microwatts_per_cm2,
+            reading.reading.uv_index,
+            reading.reading.light_lux,
+            reading.reading.battery_low,
+            reading.reading.rssi_dbm,
+            reading.reading.lqi,
+        ],
+    )?;
+    if summaries_complete {
+        // On failure the reading is still stored; the backfill includes it later.
+        let id = transaction.last_insert_rowid();
+        let savepoint = transaction.savepoint()?;
+        match hourly::record(&savepoint, id, reading.received_at_unix_ms) {
+            Ok(()) => savepoint.commit()?,
+            Err(error) => warn!("Updating the hourly weather summary failed: {error}"),
+        }
+    }
+    Ok(inserted)
 }
 
 impl History {

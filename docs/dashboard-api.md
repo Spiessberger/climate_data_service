@@ -103,8 +103,12 @@ The single bucket shown above is illustrative. Date mode contains exactly
 `min(max_points, to_unix_ms - from_unix_ms)` buckets so every bucket is at least
 one millisecond wide.
 
-The service emits contiguous, half-open, equal-width UTC buckets, including empty
-buckets. Each bucket adds `from_unix_ms`, `to_unix_ms`,
+The service emits contiguous, half-open UTC buckets, including empty buckets. The
+first bucket starts at `from_unix_ms` and the last ends at `to_unix_ms`. Buckets
+narrower than one hour are equally wide. When equal buckets would be at least one
+hour wide, every inner boundary is rounded to the nearest whole UTC hour, so
+bucket widths differ by up to an hour and the edge buckets may be up to half an
+hour shorter. Clients must use each bucket's own bounds. Each bucket adds `from_unix_ms`, `to_unix_ms`,
 `sample_count`, temperature min/max/average, relative-humidity average,
 sustained-wind average/max, gust max and rain metadata. Sensor nulls are omitted
 from their statistic; all-null and empty aggregates remain null. Wind average is
@@ -130,14 +134,39 @@ boundary gaps. These rules apply independently to full-range and bucket rain.
 Each aggregate response comes from one SQLite read transaction. Rows stream into
 fixed-size accumulators; they are not retained as a result-sized in-memory list.
 At most two aggregate jobs run concurrently. Each job has a four-second elapsed
-budget and a 2,000,000-row scan budget. Indexed probes obtain latest readings,
-range predecessors and history extents.
+budget and a 2,000,000-row scan budget; hourly summary rows count toward it. Indexed
+probes obtain latest readings, range predecessors and history extents.
 
-Date ranges cover at most 366 station-local calendar days. Exact instant ranges
-must also cover at most 366 Vienna dates and may span at most 366 days plus one
-hour, which preserves valid subranges of a maximum date selection across the
-autumn DST transition. Both exact bounds must be representable timestamps, and
-`to_unix_ms` must be greater than `from_unix_ms`.
+Range length is not limited directly, but at least one rain grouping must fit into
+600 periods, so a range may touch at most 600 calendar months. Dates and the
+Vienna dates of exact bounds must lie in the years 1 through 9999, and
+`to_unix_ms` must be greater than `from_unix_ms`. A local midnight skipped by a
+daylight-saving change starts the day at the end of the gap.
+
+## Hourly summaries
+
+The `weather_hourly` table holds one row per UTC hour with stored weather
+readings: counts, sums, minimums and maximums of each statistic, the first and
+last reading's rain evidence, and the rain pairs inside the hour. Summaries with
+hour-wide buckets combine these rows with the pairs across hour boundaries and
+read raw readings only for hours that are cut by the range bounds, a bucket
+boundary or a rain period boundary. The result is the same as aggregating the raw
+readings, apart from floating-point rounding of sums.
+
+`service_metadata` records the newest weather reading id included
+(`weather_hourly_through_id`) and the summary definition
+(`weather_hourly_version`). A request uses the summaries only when that id equals
+the newest stored reading in the same read transaction; otherwise it aggregates
+raw readings as before.
+
+The storage worker maintains the table. Each stored weather reading recomputes its
+hour in the same transaction, so readings received out of order after a host
+clock change are included correctly. A failed summary update never discards the
+reading. Readings not yet included, such as all existing readings after an upgrade
+or rows written by other processes, are backfilled in transactions of 5,000
+readings between arrivals and checked again every ten seconds. A changed summary
+definition, or a progress marker beyond the newest reading, discards the table and
+rebuilds it.
 
 Invalid parameters and range or row-budget violations return HTTP 422. Busy,
 timed-out or unavailable aggregate reads return HTTP 503. Aggregate errors use:

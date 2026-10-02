@@ -1,5 +1,6 @@
 mod aggregate;
 mod health;
+mod hourly;
 mod http;
 mod storage;
 mod wire;
