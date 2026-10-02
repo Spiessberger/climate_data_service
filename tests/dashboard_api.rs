@@ -411,3 +411,84 @@ fn web_root_serves_spa_and_assets_without_capturing_api_routes() {
             .contains("content-type: application/json")
     );
 }
+
+#[test]
+fn calendar_rain_preserves_totals_and_coverage_across_groupings() {
+    let demo = Demo::start(None);
+    let connection = Connection::open(&demo.database_path).unwrap();
+    let from = chrono::DateTime::parse_from_rfc3339("2026-01-05T00:00:00+01:00")
+        .unwrap()
+        .timestamp_millis();
+    for (offset, station, rain) in [
+        (-60_000, 1, 10.0),
+        (60_000, 1, 10.5),
+        (3_660_000, 1, 10.5),
+        (86_460_000, 1, 1.0),
+        (86_520_000, 1, 1.5),
+        (86_580_000, 2, 20.0),
+        (86_640_000, 2, 21.0),
+    ] {
+        insert_weather(
+            &connection,
+            from + offset,
+            (station, None, None, None, None, rain),
+        );
+    }
+    for grouping in ["auto", "hour", "day", "week", "month"] {
+        let (status, body) = demo.json(&format!("/api/v1/history/weather/summary?from_date=2026-01-05&through_date=2026-01-07&rain_grouping={grouping}"));
+        assert_eq!(status, 200, "{body}");
+        let buckets = body["rain_buckets"].as_array().unwrap();
+        let total: f64 = buckets
+            .iter()
+            .filter_map(|b| b["rain"]["total_mm"].as_f64())
+            .sum();
+        assert_eq!(
+            total,
+            body["statistics"]["rain"]["total_mm"].as_f64().unwrap()
+        );
+        assert_eq!(total, 2.0);
+        assert_eq!(
+            buckets
+                .iter()
+                .filter_map(|b| b["rain"]["excluded_transitions"].as_u64())
+                .sum::<u64>(),
+            2
+        );
+        assert_eq!(body["buckets"].as_array().unwrap().len(), 360);
+        if grouping == "hour" {
+            assert_eq!(buckets[1]["rain"]["total_mm"], 0.0);
+            assert!(buckets[2]["rain"]["total_mm"].is_null());
+            assert_eq!(buckets[2]["rain"]["coverage"], "unavailable");
+        }
+    }
+    let (status, _) = demo.json("/api/v1/history/weather/summary?from_date=2026-01-05&through_date=2026-01-07&rain_grouping=year");
+    assert_eq!(status, 422);
+    let (status, body) = demo.json("/api/v1/history/weather/summary?from_date=2026-01-01&through_date=2026-12-31&rain_grouping=hour");
+    assert_eq!(status, 200);
+    assert_eq!(body["rain_grouping"], "month");
+    assert_eq!(
+        body["available_rain_groupings"],
+        serde_json::json!(["day", "week", "month"])
+    );
+}
+
+#[test]
+fn current_rain_period_is_so_far_and_future_periods_are_unavailable() {
+    let demo = Demo::start(None);
+    let now = now_ms();
+    let (status, body) = demo.json(&format!(
+        "/api/v1/history/weather/summary?from_unix_ms={}&to_unix_ms={}&rain_grouping=hour",
+        now - 3_600_000,
+        now + 7_200_000
+    ));
+    assert_eq!(status, 200);
+    let buckets = body["rain_buckets"].as_array().unwrap();
+    let ongoing = buckets.iter().find(|b| b["ongoing"] == true).unwrap();
+    assert!(ongoing["observed_through_unix_ms"].as_i64().unwrap() >= now);
+    assert!(
+        ongoing["observed_through_unix_ms"].as_i64().unwrap()
+            < ongoing["to_unix_ms"].as_i64().unwrap()
+    );
+    let future = buckets.iter().find(|b| b["future"] == true).unwrap();
+    assert!(future["rain"]["total_mm"].is_null());
+}

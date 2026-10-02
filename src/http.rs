@@ -1,6 +1,6 @@
 use crate::{
     Error, Live, StorageHealth,
-    aggregate::{AggregateError, MAX_SUMMARY_POINTS, SummaryRequest},
+    aggregate::{AggregateError, MAX_SUMMARY_POINTS, RainGrouping, SummaryRequest},
     storage::{DatabaseStatusHandle, History, RangeCursor, StoredReading, Stream},
 };
 use chrono::NaiveDate;
@@ -328,6 +328,7 @@ fn parse_summary(query: Option<&str>) -> Result<SummaryQuery, ()> {
             "from_unix_ms",
             "to_unix_ms",
             "max_points",
+            "rain_grouping",
         ],
     )?;
     let from_date = parameters.remove("from_date");
@@ -342,7 +343,7 @@ fn parse_summary(query: Option<&str>) -> Result<SummaryQuery, ()> {
     if !(1..=MAX_SUMMARY_POINTS).contains(&max_points) {
         return Err(());
     }
-    let request = match (from_date, through_date, from_unix_ms, to_unix_ms) {
+    let mut request = match (from_date, through_date, from_unix_ms, to_unix_ms) {
         (Some(from), Some(through), None, None) => SummaryRequest::dates(
             from.parse::<NaiveDate>().map_err(|_| ())?,
             through.parse::<NaiveDate>().map_err(|_| ())?,
@@ -355,6 +356,8 @@ fn parse_summary(query: Option<&str>) -> Result<SummaryQuery, ()> {
         .ok_or(())?,
         _ => return Err(()),
     };
+    request.rain_grouping =
+        RainGrouping::parse(parameters.remove("rain_grouping").unwrap_or("auto")).ok_or(())?;
     Ok(SummaryQuery {
         request,
         max_points,

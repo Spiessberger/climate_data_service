@@ -1,9 +1,12 @@
 use crate::storage::{History, StoredReading, Stream, row_to_reading};
-use chrono::{DateTime, Days, LocalResult, NaiveDate, NaiveTime, Offset, TimeDelta, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Days, LocalResult, Months, NaiveDate, NaiveTime, Offset, TimeDelta,
+    TimeZone, Timelike, Utc,
+};
 use chrono_tz::Europe::Vienna;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const STATION_TIMEZONE: &str = "Europe/Vienna";
 pub(crate) const STALE_AFTER_MS: i64 = 300_000;
@@ -94,6 +97,9 @@ pub(crate) struct WeatherSummary {
     sample_count: usize,
     statistics: SummaryStatistics,
     buckets: Vec<SummaryBucket>,
+    rain_grouping: RainGrouping,
+    available_rain_groupings: Vec<RainGrouping>,
+    rain_buckets: Vec<RainBucket>,
 }
 
 #[derive(Serialize)]
@@ -113,8 +119,43 @@ enum SummaryMode {
     Instants,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum RainGrouping {
+    Auto,
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+impl RainGrouping {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "hour" => Some(Self::Hour),
+            "day" => Some(Self::Day),
+            "week" => Some(Self::Week),
+            "month" => Some(Self::Month),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RainBucket {
+    from_unix_ms: i64,
+    to_unix_ms: i64,
+    observed_through_unix_ms: i64,
+    partial_period: bool,
+    ongoing: bool,
+    future: bool,
+    rain: Rain,
+}
+
 pub(crate) struct SummaryRequest {
     mode: SummaryMode,
+    pub(crate) rain_grouping: RainGrouping,
     from_date: NaiveDate,
     through_date: NaiveDate,
     from_unix_ms: i64,
@@ -130,6 +171,7 @@ impl SummaryRequest {
         let after_through = through_date.checked_add_days(Days::new(1))?;
         Some(Self {
             mode: SummaryMode::Dates,
+            rain_grouping: RainGrouping::Auto,
             from_date,
             through_date,
             from_unix_ms: local_midnight(from_date),
@@ -150,6 +192,7 @@ impl SummaryRequest {
         }
         Some(Self {
             mode: SummaryMode::Instants,
+            rain_grouping: RainGrouping::Auto,
             from_date,
             through_date,
             from_unix_ms,
@@ -199,6 +242,102 @@ struct SummaryBucket {
     wind_speed_mps: AverageMax,
     gust_speed_mps: Maximum,
     rain: Rain,
+}
+
+// Boundaries are calendar periods in station time, clipped to the exact selected range.
+// Hourly stepping uses elapsed hours so both occurrences of the autumn 02:00 are kept.
+fn calendar_rain_intervals(
+    request: &SummaryRequest,
+    grouping: RainGrouping,
+) -> Vec<(i64, i64, bool)> {
+    let from = request.from_unix_ms;
+    let to = request.to_unix_ms;
+    let local = DateTime::from_timestamp_millis(from)
+        .unwrap()
+        .with_timezone(&Vienna);
+    let date = local.date_naive();
+    let mut start = match grouping {
+        RainGrouping::Hour => {
+            from - i64::from(local.minute()) * 60_000
+                - i64::from(local.second()) * 1_000
+                - i64::from(local.timestamp_subsec_millis())
+        }
+        RainGrouping::Day => local_midnight(date),
+        RainGrouping::Week => local_midnight(
+            date.checked_sub_days(Days::new(u64::from(date.weekday().num_days_from_monday())))
+                .unwrap_or(date),
+        ),
+        RainGrouping::Month => local_midnight(date.with_day(1).unwrap()),
+        RainGrouping::Auto => unreachable!("resolve automatic grouping first"),
+    };
+    let mut intervals = Vec::new();
+    while start < to && intervals.len() <= MAX_SUMMARY_POINTS {
+        let date = DateTime::from_timestamp_millis(start)
+            .unwrap()
+            .with_timezone(&Vienna)
+            .date_naive();
+        let end = match grouping {
+            RainGrouping::Hour => start + 3_600_000,
+            RainGrouping::Day => date
+                .checked_add_days(Days::new(1))
+                .map(local_midnight)
+                .unwrap_or(to),
+            RainGrouping::Week => date
+                .checked_add_days(Days::new(7))
+                .map(local_midnight)
+                .unwrap_or(to),
+            RainGrouping::Month => date
+                .checked_add_months(Months::new(1))
+                .map(local_midnight)
+                .unwrap_or(to),
+            RainGrouping::Auto => unreachable!(),
+        };
+        intervals.push((start.max(from), end.min(to), start < from || end > to));
+        start = end;
+    }
+    intervals
+}
+
+type RainIntervals = (RainGrouping, Vec<RainGrouping>, Vec<(i64, i64, bool)>);
+
+fn rain_intervals(request: &SummaryRequest) -> RainIntervals {
+    let days = request
+        .through_date
+        .signed_duration_since(request.from_date)
+        .num_days()
+        + 1;
+    let auto = if days <= 2 {
+        RainGrouping::Hour
+    } else if days <= 42 {
+        RainGrouping::Day
+    } else if request
+        .from_date
+        .checked_add_months(Months::new(6))
+        .is_some_and(|end| request.through_date < end)
+    {
+        RainGrouping::Week
+    } else {
+        RainGrouping::Month
+    };
+    let available = [
+        RainGrouping::Hour,
+        RainGrouping::Day,
+        RainGrouping::Week,
+        RainGrouping::Month,
+    ]
+    .into_iter()
+    .filter(|grouping| calendar_rain_intervals(request, *grouping).len() <= MAX_SUMMARY_POINTS)
+    .collect::<Vec<_>>();
+    let grouping = if available.contains(&request.rain_grouping) {
+        request.rain_grouping
+    } else {
+        auto
+    };
+    (
+        grouping,
+        available,
+        calendar_rain_intervals(request, grouping),
+    )
 }
 
 struct Budget {
@@ -413,8 +552,19 @@ impl History {
         request: SummaryRequest,
         max_points: usize,
     ) -> Result<WeatherSummary, AggregateError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let (rain_grouping, available_rain_groupings, rain_intervals) = rain_intervals(&request);
+        let mut rainfall = rain_intervals
+            .iter()
+            .map(|_| RainAccumulator::default())
+            .collect::<Vec<_>>();
+        let mut rain_index = 0;
         let SummaryRequest {
             mode,
+            rain_grouping: _,
             from_date,
             through_date,
             from_unix_ms,
@@ -452,6 +602,12 @@ impl History {
                 bucket.sample_count += 1;
                 add_values(bucket, sample);
                 bucket.rain.observe(previous.as_ref(), sample);
+                while rain_index + 1 < rain_intervals.len()
+                    && sample.received_at_unix_ms >= rain_intervals[rain_index].1
+                {
+                    rain_index += 1;
+                }
+                rainfall[rain_index].observe(previous.as_ref(), sample);
                 previous = Some(sample.clone());
             },
         )?;
@@ -501,6 +657,24 @@ impl History {
             sample_count,
             statistics,
             buckets,
+            rain_grouping,
+            available_rain_groupings,
+            rain_buckets: rain_intervals
+                .into_iter()
+                .zip(rainfall)
+                .map(|((from, to, partial), rain)| {
+                    let observed_through = now.clamp(from, to);
+                    RainBucket {
+                        from_unix_ms: from,
+                        to_unix_ms: to,
+                        observed_through_unix_ms: observed_through,
+                        partial_period: partial,
+                        ongoing: from <= now && now < to,
+                        future: now < from,
+                        rain: rain.finish(observed_through),
+                    }
+                })
+                .collect(),
         })
     }
 }
@@ -743,5 +917,83 @@ mod tests {
         let maximum_utc = DateTime::<Utc>::MAX_UTC.timestamp_millis();
         assert!(station_date(maximum_utc).is_none());
         assert!(SummaryRequest::instants(maximum_utc - 1, maximum_utc).is_none());
+    }
+    fn date_request(from: &str, through: &str, grouping: RainGrouping) -> SummaryRequest {
+        let mut request =
+            SummaryRequest::dates(from.parse().unwrap(), through.parse().unwrap()).unwrap();
+        request.rain_grouping = grouping;
+        request
+    }
+
+    #[test]
+    fn rain_hours_and_days_follow_both_dst_transitions() {
+        for (date, hours) in [("2026-03-29", 23), ("2026-10-25", 25)] {
+            let request = date_request(date, date, RainGrouping::Hour);
+            let (_, _, intervals) = rain_intervals(&request);
+            assert_eq!(intervals.len(), hours);
+            assert!(
+                intervals
+                    .iter()
+                    .all(|(from, to, partial)| to - from == 3_600_000 && !partial)
+            );
+            let daily = calendar_rain_intervals(&request, RainGrouping::Day);
+            assert_eq!(daily.len(), 1);
+            assert_eq!(daily[0].1 - daily[0].0, hours as i64 * 3_600_000);
+        }
+    }
+
+    #[test]
+    fn rain_weeks_start_monday_and_months_keep_calendar_lengths() {
+        let request = date_request("2026-09-30", "2026-10-06", RainGrouping::Week);
+        let (_, _, intervals) = rain_intervals(&request);
+        assert_eq!(intervals.len(), 2);
+        let monday = local_midnight("2026-10-05".parse().unwrap());
+        assert_eq!(
+            intervals,
+            vec![
+                (request.from_unix_ms, monday, true),
+                (monday, request.to_unix_ms, true)
+            ]
+        );
+        let request = date_request("2028-02-01", "2028-03-31", RainGrouping::Month);
+        let (_, _, intervals) = rain_intervals(&request);
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].1 - intervals[0].0, 29 * 86_400_000);
+        assert_eq!(intervals[1].1 - intervals[1].0, 31 * 86_400_000 - 3_600_000);
+        assert!(intervals.iter().all(|(_, _, partial)| !partial));
+    }
+
+    #[test]
+    fn rain_auto_and_oversized_hour_selection_resolve_to_bounded_buckets() {
+        for (through, expected) in [
+            ("2026-01-02", RainGrouping::Hour),
+            ("2026-02-11", RainGrouping::Day),
+            ("2026-02-12", RainGrouping::Week),
+            ("2026-06-30", RainGrouping::Week),
+            ("2026-07-01", RainGrouping::Month),
+        ] {
+            let request = date_request("2026-01-01", through, RainGrouping::Auto);
+            assert_eq!(rain_intervals(&request).0, expected);
+        }
+        let request = date_request("2026-01-01", "2026-12-31", RainGrouping::Hour);
+        let (grouping, available, intervals) = rain_intervals(&request);
+        assert_eq!(grouping, RainGrouping::Month);
+        assert!(!available.contains(&RainGrouping::Hour));
+        assert_eq!(intervals.len(), 12);
+        let request = date_request("2026-01-01", "2026-01-25", RainGrouping::Hour);
+        assert_eq!(rain_intervals(&request).2.len(), 600);
+    }
+
+    #[test]
+    fn rain_exact_ranges_clip_edge_periods_without_expanding_them() {
+        let midnight = local_midnight("2026-10-05".parse().unwrap());
+        let request = SummaryRequest::instants(midnight + 123, midnight + 3_600_456).unwrap();
+        assert_eq!(
+            rain_intervals(&request).2,
+            vec![
+                (midnight + 123, midnight + 3_600_000, true),
+                (midnight + 3_600_000, midnight + 3_600_456, true),
+            ]
+        );
     }
 }
