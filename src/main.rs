@@ -1,7 +1,7 @@
 use clap::Parser;
-use climate_data_service::{Diagnostic, DiagnosticKind, Service, logs::DailyLogs};
+use climate_data_service::Service;
+use log::{error, info};
 use std::{
-    io::Write,
     net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::mpsc,
@@ -23,9 +23,6 @@ struct Config {
     /// Local SQLite database containing retained climate history
     #[arg(long, default_value = "./data/climate.sqlite3")]
     database: PathBuf,
-    /// Daily retained operational and lossless diagnostic files
-    #[arg(long, default_value = "./logs")]
-    log_dir: PathBuf,
     /// Built web application directory (the contents of weatherstation_web/dist)
     #[arg(long)]
     web_root: Option<PathBuf>,
@@ -38,63 +35,59 @@ fn utc_unix_ms() -> i64 {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() {
     let config = Config::parse();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .target(env_logger::Target::Stdout)
+        .format_timestamp_millis()
+        .init();
+    if let Err(error) = run(config) {
+        error!("Service failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!(
+        "climate-data-service {} starting (serial {}, database {})",
+        env!("CARGO_PKG_VERSION"),
+        config.serial.display(),
+        config.database.display()
+    );
     let listener = TcpListener::bind(config.listen)?;
     let address = listener.local_addr()?;
     let (shutdown, receive_shutdown) = mpsc::sync_channel(1);
     ctrlc::set_handler(move || {
         let _ = shutdown.try_send(());
     })?;
-    let (log_sender, log_events) = mpsc::sync_channel(128);
-    let logs = DailyLogs::start(&config.log_dir);
-    let file_sender = logs.sender();
-    let log_status = logs.status_handle();
-    let service = Service::start_with_web_root_and_log_status(
-        config
-            .serial
-            .to_str()
-            .ok_or("serial path must be valid UTF-8")?,
-        listener,
-        &config.database,
-        config.web_root,
-        log_status,
-        utc_unix_ms,
-        // A blocked stderr must not stall serial ingestion or health deadlines.
-        move |diagnostic| {
-            let received_at_unix_ms = utc_unix_ms();
-            file_sender.record(
-                received_at_unix_ms,
-                Diagnostic {
-                    kind: diagnostic.kind,
-                    bytes: diagnostic.bytes,
-                },
-            );
-            if diagnostic.kind == DiagnosticKind::Operational {
-                let _ = log_sender.try_send((received_at_unix_ms, diagnostic.bytes.to_vec()));
-            }
-        },
-    )?;
-    eprintln!("Listening on http://{address}");
-    // Intentionally not joined: a stalled output sink cannot prevent shutdown.
-    std::thread::spawn(move || {
-        for (received_at_unix_ms, bytes) in log_events {
-            let _ = writeln!(
-                std::io::stderr().lock(),
-                "INFO - {received_at_unix_ms} {}",
-                String::from_utf8_lossy(&bytes)
-            );
-        }
-    });
+    let serial = config
+        .serial
+        .to_str()
+        .ok_or("serial path must be valid UTF-8")?;
+    // The socket is already bound, so clients may connect before the service starts.
+    info!("Listening on http://{address}");
+    let service = match config.web_root {
+        Some(web_root) => Service::start_with_web_root(
+            serial,
+            listener,
+            &config.database,
+            web_root,
+            utc_unix_ms,
+            // The service logs every diagnostic itself.
+            |_| {},
+        )?,
+        None => Service::start(
+            serial,
+            listener,
+            &config.database,
+            utc_unix_ms,
+            // The service logs every diagnostic itself.
+            |_| {},
+        )?,
+    };
     receive_shutdown.recv()?;
+    info!("Shutdown requested");
     drop(service);
-    logs.sender().record(
-        utc_unix_ms(),
-        Diagnostic {
-            kind: DiagnosticKind::Operational,
-            bytes: br#"{"event":"service_stopped"}"#,
-        },
-    );
-    drop(logs);
+    info!("Service stopped");
     Ok(())
 }

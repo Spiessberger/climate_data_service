@@ -1,7 +1,6 @@
 use crate::{
-    Error, Live, LogHealth, StorageHealth,
+    Error, Live, StorageHealth,
     aggregate::{AggregateError, MAX_SUMMARY_POINTS, SummaryRequest},
-    logs::LogStatusHandle,
     storage::{DatabaseStatusHandle, History, RangeCursor, StoredReading, Stream},
 };
 use chrono::NaiveDate;
@@ -13,16 +12,17 @@ use hyper::{
     service::service_fn,
 };
 use hyper_util::rt::TokioIo;
+use log::{debug, error, info, warn};
 use std::{
     collections::BTreeMap,
     convert::Infallible,
     fs,
     io::Read,
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Semaphore, oneshot},
@@ -58,7 +58,6 @@ struct HttpContext {
     live: Arc<RwLock<Live>>,
     history: History,
     database_status: DatabaseStatusHandle,
-    log_status: Option<LogStatusHandle>,
     aggregates: Arc<Semaphore>,
     web_root: Option<PathBuf>,
     web_files: Arc<Semaphore>,
@@ -75,12 +74,15 @@ impl HttpServer {
         live: Arc<RwLock<Live>>,
         history: History,
         database_status: DatabaseStatusHandle,
-        log_status: Option<LogStatusHandle>,
         web_root: Option<PathBuf>,
     ) -> Result<Self, Error> {
         let web_root = web_root.map(fs::canonicalize).transpose()?;
         if web_root.as_ref().is_some_and(|path| !path.is_dir()) {
             return Err("web root must be a directory".into());
+        }
+        match &web_root {
+            Some(root) => info!("Serving web application from {}", root.display()),
+            None => info!("No web root configured; serving APIs only"),
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -96,7 +98,6 @@ impl HttpServer {
             live,
             history,
             database_status,
-            log_status,
             aggregates,
             web_root,
             web_files,
@@ -110,27 +111,57 @@ impl HttpServer {
                         _ = &mut stopping => break,
                         Some(_) = clients.join_next(), if !clients.is_empty() => {},
                         accepted = listener.accept(), if clients.len() < 64 => {
-                            let Ok((socket, _)) = accepted else { break };
+                            let (socket, peer) = match accepted {
+                                Ok(accepted) => accepted,
+                                Err(error) => {
+                                    error!("HTTP accept failed: {error}; HTTP server stopping");
+                                    break;
+                                }
+                            };
                             let context = context.clone();
                             clients.spawn(async move {
                                 let service = service_fn(move |request| {
-                                    respond(request, context.clone())
+                                    logged_respond(request, context.clone(), peer)
                                 });
                                 let mut builder = http1::Builder::new();
                                 builder.keep_alive(false).max_buf_size(8192);
                                 let connection = builder.serve_connection(TokioIo::new(socket), service);
-                                let _ = tokio::time::timeout(Duration::from_secs(5), connection).await;
+                                match tokio::time::timeout(Duration::from_secs(5), connection).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => debug!("HTTP connection from {peer} failed: {error}"),
+                                    Err(_) => debug!("HTTP connection from {peer} closed at the 5 s deadline"),
+                                }
                             });
                         },
                     }
                 }
-            })
+            });
+            debug!("HTTP server stopped");
         });
         Ok(Self {
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
     }
+}
+
+async fn logged_respond(
+    request: Request<Incoming>,
+    context: HttpContext,
+    peer: SocketAddr,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    let started = Instant::now();
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let response = respond(request, context).await;
+    if let Ok(response) = &response {
+        debug!(
+            "{peer} {method} {uri} -> {} in {} ms",
+            response.status().as_u16(),
+            started.elapsed().as_millis()
+        );
+    }
+    response
 }
 
 async fn respond(
@@ -182,17 +213,6 @@ async fn respond(
                 let mut snapshot = context.live.read().unwrap().clone();
                 snapshot.storage = StorageHealth {
                     database: context.database_status.read().unwrap().clone(),
-                    logs: context
-                        .log_status
-                        .as_ref()
-                        .map(|status| {
-                            let status = status.lock().unwrap();
-                            LogHealth {
-                                available: status.available,
-                                last_error: status.last_error.clone(),
-                            }
-                        })
-                        .unwrap_or_default(),
                 };
                 (StatusCode::OK, serde_json::to_string(&snapshot).unwrap())
             }
@@ -264,29 +284,38 @@ fn aggregate_response<T: serde::Serialize>(
 ) -> (StatusCode, String) {
     match result {
         Ok(Ok(value)) => (StatusCode::OK, serde_json::to_string(&value).unwrap()),
-        Ok(Err(AggregateError::RowBudget)) => error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "row_budget_exceeded",
-            "aggregate range exceeds the row budget",
-        ),
-        Ok(Err(AggregateError::Timeout)) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "aggregate_timeout",
-            "aggregate query exceeded its time budget",
-        ),
+        Ok(Err(AggregateError::RowBudget)) => {
+            info!("Aggregate query rejected: range exceeds the row budget");
+            error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "row_budget_exceeded",
+                "aggregate range exceeds the row budget",
+            )
+        }
+        Ok(Err(AggregateError::Timeout)) => {
+            warn!("Aggregate query exceeded its time budget");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "aggregate_timeout",
+                "aggregate query exceeded its time budget",
+            )
+        }
         Ok(Err(AggregateError::Database(error))) => {
-            let _ = error;
+            error!("Aggregate query failed: {error}");
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "aggregate_unavailable",
                 "aggregate data is temporarily unavailable",
             )
         }
-        Err(_) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "aggregate_unavailable",
-            "aggregate data is temporarily unavailable",
-        ),
+        Err(error) => {
+            error!("Aggregate task failed: {error}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "aggregate_unavailable",
+                "aggregate data is temporarily unavailable",
+            )
+        }
     }
 }
 
@@ -464,6 +493,7 @@ fn invalid_aggregate_query(message: &str) -> (StatusCode, String) {
 }
 
 fn aggregate_busy() -> (StatusCode, String) {
+    warn!("Aggregate workers busy; rejecting request");
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         "aggregate_busy",
@@ -486,11 +516,22 @@ fn history_response(
             StatusCode::OK,
             serde_json::to_string(&serde_json::json!({"readings": readings})).unwrap(),
         ),
-        Ok(Err(_)) | Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{\"error\":\"history unavailable\"}".to_owned(),
-        ),
+        Ok(Err(error)) => {
+            error!("History query failed: {error}");
+            history_unavailable()
+        }
+        Err(error) => {
+            error!("History task failed: {error}");
+            history_unavailable()
+        }
     }
+}
+
+fn history_unavailable() -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{\"error\":\"history unavailable\"}".to_owned(),
+    )
 }
 
 fn json_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
@@ -526,6 +567,7 @@ async fn static_response(
             .unwrap();
     }
     let Ok(permit) = web_files.try_acquire_owned() else {
+        warn!("Static file workers busy; rejecting request");
         return static_unavailable();
     };
     let method = request.method().clone();
@@ -537,7 +579,10 @@ async fn static_response(
     .await
     {
         Ok(response) => response,
-        Err(_) => static_unavailable(),
+        Err(error) => {
+            error!("Static file task failed: {error}");
+            static_unavailable()
+        }
     }
 }
 
@@ -581,6 +626,10 @@ fn static_response_blocking(method: Method, raw_path: &str, root: &Path) -> Resp
         return static_not_found();
     };
     if metadata.len() > MAX_STATIC_FILE_BYTES {
+        warn!(
+            "Static file {} exceeds the {MAX_STATIC_FILE_BYTES}-byte limit",
+            canonical.display()
+        );
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)
             .header("Content-Type", "text/plain; charset=utf-8")

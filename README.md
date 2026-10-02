@@ -16,9 +16,7 @@ curl 'http://127.0.0.1:8080/history/indoor/updates?after_id=0&limit=100'
 
 `--serial` is required. `--database` defaults to `./data/climate.sqlite3`, relative
 to the invocation directory, and its parent directories are created as needed.
-`--log-dir` defaults to `./logs`, also relative to the invocation directory.
-Daily operational and lossless diagnostic files are retained indefinitely; see
-[daily logs](docs/daily-logs.md) for formats, bounded handoff, and synchronization.
+Logs go to stdout; see [Logging](#logging) for levels and `RUST_LOG`.
 `--listen` defaults to `127.0.0.1:8080`; an explicit trusted network address permits
 remote clients. HTTP is read-only and unauthenticated.
 `--web-root` is optional and names the contents of a built web application. When
@@ -35,7 +33,7 @@ gateway availability is false until a valid heartbeat or indoor reading arrives.
 After reception it returns:
 
 ```json
-{"indoor":{"v":1,"type":"indoor","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":42,"temperature_celsius":21.5,"relative_humidity_percent":48.2,"received_at_unix_ms":1800000000123},"weather":null,"gateway":{"available":true,"boot_id":"6a9d3c1f80b24e67a511d92cb837046e","last_received_at_unix_ms":1800000000123,"restart_count":0,"indoor":{"last_seq":42,"observed_missing_readings":0},"weather":{"last_seq":null,"observed_missing_readings":0}},"storage":{"database":{"available":true,"last_error":null},"logs":{"available":true,"last_error":null}}}
+{"indoor":{"v":1,"type":"indoor","boot_id":"6a9d3c1f80b24e67a511d92cb837046e","seq":42,"temperature_celsius":21.5,"relative_humidity_percent":48.2,"received_at_unix_ms":1800000000123},"weather":null,"gateway":{"available":true,"boot_id":"6a9d3c1f80b24e67a511d92cb837046e","last_received_at_unix_ms":1800000000123,"restart_count":0,"indoor":{"last_seq":42,"observed_missing_readings":0},"weather":{"last_seq":null,"observed_missing_readings":0}},"storage":{"database":{"available":true,"last_error":null}}}
 ```
 
 Reception time is the Linux host's UTC Unix milliseconds, not sensor measurement
@@ -77,22 +75,16 @@ HTTP address that can also be polled with curl. Ctrl-C stops the process.
 ## Scope and continuation
 
 This implements tickets 01–06 plus the persisted dashboard/summary view: indoor
-and weather live HTTP, retained SQLite history, gateway health/reconnect, daily
-logs with damaged-input recovery, storage failure recovery, and bounded web-facing
-aggregates. `/live` reports database and log-file health separately.
+and weather live HTTP, retained SQLite history, gateway health/reconnect,
+damaged-input recovery, storage failure recovery, and bounded web-facing
+aggregates. `/live` reports database health.
 See [weather readings](docs/weather.md) for the complete weather schema, independent
 live/health state, weather history routes, and the finite weather demonstration. A service restart starts with no live reading or counter baseline.
 
 The parser offers original non-data, rejected, overlong and partial bytes in
-bounded chunks. A dedicated worker appends these losslessly to daily diagnostic
-files and preserves gateway text and service events in readable operational files.
-Dirty files synchronize every 60 seconds, on date changes, and during ordinary
-shutdown, including directory entries. Restarts and clock rollback append to
-retained dates. A bounded nonblocking handoff isolates live service from disk
-stalls; saturated handoffs may lose chunks and have no replay backlog. Service
-events also go to stderr through an independent bounded handoff.
+bounded chunks to the diagnostic callback, and the service logs them.
 
-Serial ingestion, database writes, log-file work, and HTTP run independently. SQLite is bundled
+Serial ingestion, database writes, and HTTP run independently. SQLite is bundled
 so the application controls the runtime version; startup enforces SQLite 3.51.3 or
 newer. History uses WAL, FULL synchronous commits, a 1000-page passive automatic
 checkpoint threshold, short read connections, and pages capped at 1000 rows.
@@ -102,6 +94,37 @@ five-second connection deadline; slow clients cannot hold live or database locks
 Aggregate reads admit at most two jobs, scan no more than 2,000,000 rows for at
 most four seconds, and stream into bounded statistics state. Static files use a
 separate four-job blocking limit and a 16 MiB per-file limit.
+
+## Logging
+
+The service logs through the `log` crate, and the binary writes the records to
+stdout with `env_logger`, one line each:
+
+```text
+[2026-10-02T13:31:42.053Z WARN  climate_data_service::health] Missed 2 indoor reading(s): seq 1 -> 4 (boot 6a9d…)
+```
+
+The default level is `info`. Set `RUST_LOG` to change it, globally or per target:
+
+```sh
+RUST_LOG=debug climate-data-service --serial …
+RUST_LOG=info,climate_data_service::http=debug climate-data-service --serial …
+```
+
+| Level | What is logged |
+| ----- | -------------- |
+| `error` | Database open/write failures (once per new failure), history and aggregate query failures, HTTP accept failure, startup failure |
+| `warn` | Serial unavailable/disconnected, gateway timeout and restarts, missed or repeated sequence numbers, rejected/oversized/partial input, readings dropped because storage is full or unavailable, database write retries, busy aggregate/static workers |
+| `info` | Startup configuration, listening address, database opened/reopened/recovered, serial connected, gateway available, shutdown |
+| `debug` | Every indoor and weather reading with its values, every stored row ID, every HTTP request (peer, method, URI, status, duration), HTTP connection errors/deadlines, repeated serial/database retry failures, shutdown steps |
+| `trace` | Gateway heartbeats and serial byte counts |
+
+Gateway firmware output uses the `gateway` target. The service keeps the gateway's
+own `ERROR`/`WARN`/`INFO`/`DEBUG`/`TRACE - ` prefixes as the record level (lines
+containing `PANIC` are errors, other text is `info`), so for example
+`RUST_LOG=info,gateway=warn` hides routine firmware messages. Logging happens on
+the thread producing the event, so stdout must be drained (a terminal, journald or
+a reading pipe); write errors are ignored.
 
 ## Development
 
@@ -114,8 +137,8 @@ cargo test --locked
 
 Integration tests exercise real pseudo-terminals, temporary SQLite databases, and
 loopback HTTP, including the foreground executable, committed visibility, restart
-persistence, range/incremental ordering, malformed input, lossless retained files, UTC rotation/rollback, periodic and failed/blocked
-synchronization, framing recovery, reception time, and delayed writes.
+persistence, range/incremental ordering, malformed input, framing recovery,
+reception time, and delayed writes.
 Controlled monotonic and UTC clocks also exercise exact heartbeat deadlines,
 sensor silence, restart/counter continuity and configured-device reconnects.
 The tests need

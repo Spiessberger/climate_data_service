@@ -1,4 +1,5 @@
 use crate::{ClimateReading, LiveIndoorReading, LiveWeatherReading};
+use log::{debug, error, info, warn};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use std::{
@@ -90,6 +91,11 @@ impl Storage {
         let status = Arc::new(RwLock::new(DatabaseStatus::default()));
         let initial_connection = match open_database(path) {
             Ok(connection) => {
+                info!(
+                    "Opened database {} (SQLite {})",
+                    path.display(),
+                    rusqlite::version()
+                );
                 mark_available(&status);
                 Some(connection)
             }
@@ -113,6 +119,8 @@ impl Storage {
                 match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(reading) => {
                         let Some(mut current) = connection.take() else {
+                            let (stream, seq) = reading.describe();
+                            warn!("Database unavailable; discarding {stream} reading seq {seq}");
                             continue;
                         };
                         match store_reading(&mut current, &reading) {
@@ -132,6 +140,7 @@ impl Storage {
             }
             while let Ok(reading) = receiver.try_recv() {
                 let Some(connection) = connection.as_mut() else {
+                    warn!("Database unavailable; discarding readings queued at shutdown");
                     break;
                 };
                 if let Err(error) = store_reading(connection, &reading) {
@@ -139,6 +148,7 @@ impl Storage {
                     break;
                 }
             }
+            debug!("Storage worker stopped");
         });
         Ok((
             Self {
@@ -251,6 +261,7 @@ fn open_database(path: &Path) -> rusqlite::Result<Connection> {
 fn reopen_database(path: &Path, status: &DatabaseStatusHandle) -> Option<Connection> {
     match open_database(path) {
         Ok(connection) => {
+            info!("Reopened database {}", path.display());
             mark_reopened(status);
             Some(connection)
         }
@@ -263,6 +274,9 @@ fn reopen_database(path: &Path, status: &DatabaseStatusHandle) -> Option<Connect
 
 fn mark_available(status: &DatabaseStatusHandle) {
     let mut status = status.write().unwrap();
+    if status.last_error.is_some() {
+        info!("Database writes succeeding again");
+    }
     status.available = true;
     status.last_error = None;
 }
@@ -271,10 +285,18 @@ fn mark_reopened(status: &DatabaseStatusHandle) {
     status.write().unwrap().available = true;
 }
 
+/// Logs a new or changed failure as an error; repeats of the same failure
+/// (such as the once-per-second reopen attempts) only at debug level.
 fn mark_failed(status: &DatabaseStatusHandle, error: &impl std::fmt::Display) {
     let mut status = status.write().unwrap();
+    let error = error.to_string();
+    if status.available || status.last_error.as_ref() != Some(&error) {
+        error!("Database unavailable: {error}; retrying every second");
+    } else {
+        debug!("Database still unavailable: {error}");
+    }
     status.available = false;
-    status.last_error = Some(error.to_string());
+    status.last_error = Some(error);
 }
 
 enum WriteError {
@@ -292,12 +314,19 @@ impl std::fmt::Display for WriteError {
 }
 
 fn store_reading(connection: &mut Connection, reading: &ClimateReading) -> Result<(), WriteError> {
+    let (stream, seq) = reading.describe();
     for attempt in 0..STORAGE_WRITE_ATTEMPTS {
         match store_attempt(connection, reading) {
-            Ok(()) => return Ok(()),
+            Ok(id) => {
+                debug!("Stored {stream} reading seq {seq} as row {id}");
+                return Ok(());
+            }
             Err(WriteError::Retryable(error)) if attempt + 1 < STORAGE_WRITE_ATTEMPTS => {
+                warn!(
+                    "Storing {stream} reading seq {seq} failed (attempt {} of {STORAGE_WRITE_ATTEMPTS}): {error}; retrying",
+                    attempt + 1
+                );
                 thread::sleep(Duration::from_millis(25 * (attempt as u64 + 1)));
-                let _ = error;
             }
             Err(error) => return Err(error),
         }
@@ -305,7 +334,7 @@ fn store_reading(connection: &mut Connection, reading: &ClimateReading) -> Resul
     unreachable!("the bounded storage retry loop always returns")
 }
 
-fn store_attempt(connection: &mut Connection, reading: &ClimateReading) -> Result<(), WriteError> {
+fn store_attempt(connection: &mut Connection, reading: &ClimateReading) -> Result<i64, WriteError> {
     let transaction = connection.transaction().map_err(WriteError::Retryable)?;
     let result = match reading {
         ClimateReading::Indoor(reading) => transaction.execute(
@@ -355,7 +384,9 @@ fn store_attempt(connection: &mut Connection, reading: &ClimateReading) -> Resul
         ),
     };
     result.map_err(WriteError::Retryable)?;
-    transaction.commit().map_err(WriteError::Failed)
+    let id = transaction.last_insert_rowid();
+    transaction.commit().map_err(WriteError::Failed)?;
+    Ok(id)
 }
 
 impl History {
@@ -497,8 +528,10 @@ impl Drop for Storage {
             while !thread.is_finished() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
             }
-            if thread.is_finished() {
-                let _ = thread.join();
+            if !thread.is_finished() {
+                warn!("Storage worker did not stop within 1 s; abandoning it");
+            } else if thread.join().is_err() {
+                error!("Storage worker thread panicked");
             }
         }
     }

@@ -15,8 +15,13 @@ impl Drop for Process {
     }
 }
 
+fn listening_address(line: &str) -> Option<&str> {
+    line.split_once("Listening on http://")
+        .map(|(_, address)| address.trim())
+}
+
 #[test]
-fn absent_serial_keeps_http_running_and_reports_the_transition_on_stderr() {
+fn absent_serial_keeps_http_running_and_reports_the_transition_on_stdout() {
     let directory = tempfile::tempdir().unwrap();
     let serial_path = directory.path().join("missing-gateway");
     let mut process = Process(
@@ -26,23 +31,24 @@ fn absent_serial_keeps_http_running_and_reports_the_transition_on_stderr() {
             .current_dir(directory.path())
             .args(["--listen", "127.0.0.1:0", "--database"])
             .arg(directory.path().join("climate.sqlite3"))
-            .stderr(Stdio::piped())
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
     );
-    let stderr = process.0.stderr.take().unwrap();
+    let stdout = process.0.stdout.take().unwrap();
     let (send, lines) = std::sync::mpsc::channel();
     thread::spawn(move || {
-        for line in BufReader::new(stderr).lines() {
+        for line in BufReader::new(stdout).lines() {
             if send.send(line.unwrap()).is_err() {
                 break;
             }
         }
     });
-    let startup = lines.recv_timeout(Duration::from_secs(2)).unwrap();
-    let address = startup
-        .strip_prefix("Listening on http://")
-        .expect(&startup);
+    let startup = std::iter::from_fn(|| lines.recv_timeout(Duration::from_secs(2)).ok())
+        .find(|line| listening_address(line).is_some())
+        .expect("missing startup address");
+    let address = listening_address(&startup).unwrap();
     let mut stream = TcpStream::connect(address).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -57,46 +63,18 @@ fn absent_serial_keeps_http_running_and_reports_the_transition_on_stderr() {
         serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(live["gateway"]["available"], false);
     assert_eq!(live["indoor"], serde_json::Value::Null);
-    let event = lines
-        .recv_timeout(Duration::from_secs(2))
+    let event = std::iter::from_fn(|| lines.recv_timeout(Duration::from_secs(2)).ok())
+        .find(|line| line.contains("unavailable"))
         .expect("missing operational transition");
-    assert!(event.contains("serial_unavailable"), "{event}");
+    assert!(event.contains("WARN"), "{event}");
     assert!(event.contains(serial_path.to_str().unwrap()), "{event}");
     assert!(process.0.try_wait().unwrap().is_none());
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let retained = std::fs::read_dir(directory.path().join("logs"))
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with("operational.jsonl")
-            })
-            .any(|entry| {
-                std::fs::read_to_string(entry.path())
-                    .unwrap()
-                    .contains("serial_unavailable")
-            });
-        if retained {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "default log directory did not retain the service event"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
 }
 
 #[test]
 fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("history.sqlite3");
-    let log_dir = directory.path().join("chosen-logs");
     let (mut master, slave) = TTYPort::pair().unwrap();
     let serial = slave.name().unwrap();
     drop(slave);
@@ -104,20 +82,21 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
         Command::new(env!("CARGO_BIN_EXE_climate-data-service"))
             .args(["--serial", &serial, "--listen", "127.0.0.1:0", "--database"])
             .arg(&database)
-            .arg("--log-dir")
-            .arg(&log_dir)
-            .stderr(Stdio::piped())
+            .env("RUST_LOG", "debug")
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
     );
+    let mut stdout = BufReader::new(process.0.stdout.take().unwrap());
     let mut startup = String::new();
-    BufReader::new(process.0.stderr.take().unwrap())
-        .read_line(&mut startup)
-        .unwrap();
-    let address = startup
-        .trim()
-        .strip_prefix("Listening on http://")
-        .expect(&startup);
+    while listening_address(&startup).is_none() {
+        startup.clear();
+        assert!(
+            stdout.read_line(&mut startup).unwrap() > 0,
+            "missing startup address"
+        );
+    }
+    let address = listening_address(&startup).unwrap();
     let request = |method: &str, path: &str| {
         let mut stream = TcpStream::connect(address).unwrap();
         stream
@@ -191,30 +170,23 @@ fn foreground_process_opens_selected_serial_and_serves_read_only_http() {
         assert!(Instant::now() < deadline, "shutdown did not complete");
         thread::sleep(Duration::from_millis(5));
     }
-    let diagnostic = std::fs::read_dir(&log_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .find(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .ends_with("diagnostic.jsonl")
-        })
-        .unwrap();
-    let retained: Vec<u8> = std::fs::read_to_string(diagnostic.path())
-        .unwrap()
-        .lines()
-        .flat_map(|line| {
-            let record: serde_json::Value = serde_json::from_str(line).unwrap();
-            record["bytes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|byte| byte.as_u64().unwrap() as u8)
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    assert_eq!(retained, b"INFO - foreground log\nPANIC: \xff\n");
+    let mut output = String::new();
+    stdout.read_to_string(&mut output).unwrap();
+    assert!(output.contains("INFO  gateway] foreground log"), "{output}");
+    assert!(
+        output.contains("ERROR gateway] PANIC: \u{fffd}"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Indoor reading seq 1: 21.5 °C, 48.2 %RH"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Stored indoor reading seq 1 as row 1"),
+        "{output}"
+    );
+    assert!(output.contains("GET /live -> 200"), "{output}");
+    assert!(output.contains("Service stopped"), "{output}");
 }
 
 #[test]
@@ -236,6 +208,5 @@ fn serial_selection_is_required_and_http_defaults_to_loopback() {
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("127.0.0.1:8080"));
     assert!(help.contains("./data/climate.sqlite3"));
-    assert!(help.contains("./logs"));
-    assert!(help.contains("--log-dir"));
+    assert!(!help.contains("--log-dir"));
 }

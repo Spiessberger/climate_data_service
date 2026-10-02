@@ -50,10 +50,9 @@ path; restarts identify both boots; gaps identify stream, boot, counters and the
 observed missing count. Repeated failed open attempts and steady valid traffic do
 not repeat state-transition events.
 
-The foreground binary sends these events with UTC Unix millisecond timestamps to
-stderr through a 128-event nonblocking queue. A stalled sink may drop events; it
-cannot stall live acquisition or shutdown. Daily permanent files are a later slice.
+The service also logs each event: connections and recoveries at `info`,
+unavailability, timeouts, restarts, gaps and repeated counters at `warn`.
 `Service::start_with_clock` accepts independent UTC and monotonic clocks for tests
-at the serial/HTTP/log boundary. Production `Service::start` uses `Instant` for
+at the serial/HTTP boundary. Production `Service::start` uses `Instant` for
 elapsed time. Integration coverage uses Linux pseudo-terminals and real temporary
 SQLite; it does not claim physical USB or flashed-firmware verification.

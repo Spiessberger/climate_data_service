@@ -1,10 +1,10 @@
 mod aggregate;
 mod health;
 mod http;
-pub mod logs;
 mod storage;
 mod wire;
 
+use log::{Level, debug, error, log, trace, warn};
 use serde::Serialize;
 use std::{
     io::{self, Read},
@@ -13,6 +13,7 @@ use std::{
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
+        mpsc::{SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -22,8 +23,8 @@ use wire::{Framer, IndoorReading, Record, WeatherReading};
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Raw input in bounded chunks, or one JSON service operational event.
-/// Offered synchronously. Persistence adapters must use a bounded, nonblocking
-/// handoff (such as `logs::LogSender`); never write files on this thread.
+/// Offered synchronously on the serial thread, so callbacks should return quickly.
+/// The service also logs every diagnostic through the `log` crate.
 #[derive(Debug)]
 pub struct Diagnostic<'a> {
     pub kind: DiagnosticKind,
@@ -60,16 +61,18 @@ enum ClimateReading {
     Weather(LiveWeatherReading),
 }
 
-#[derive(Clone, Default, Serialize)]
-struct LogHealth {
-    available: bool,
-    last_error: Option<String>,
+impl ClimateReading {
+    fn describe(&self) -> (&'static str, u32) {
+        match self {
+            Self::Indoor(reading) => ("indoor", reading.reading.seq),
+            Self::Weather(reading) => ("weather", reading.reading.seq),
+        }
+    }
 }
 
 #[derive(Clone, Default, Serialize)]
 struct StorageHealth {
     database: storage::DatabaseStatus,
-    logs: LogHealth,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -81,11 +84,77 @@ struct Live {
 }
 
 fn operational(event: health::Event, diagnostic: &mut impl FnMut(Diagnostic<'_>)) {
+    event.log();
     let bytes = serde_json::to_vec(&event).expect("operational event contains serializable fields");
     diagnostic(Diagnostic {
         kind: DiagnosticKind::Operational,
         bytes: &bytes,
     });
+}
+
+fn log_diagnostic(diagnostic: &Diagnostic<'_>) {
+    let text = String::from_utf8_lossy(diagnostic.bytes);
+    let text = text.trim_end();
+    match diagnostic.kind {
+        // Logged at the event's own level by `operational`.
+        DiagnosticKind::Operational => {}
+        DiagnosticKind::Text if text.is_empty() => {}
+        DiagnosticKind::Text => {
+            let (level, message) = gateway_log_level(text);
+            log!(target: "gateway", level, "{message}");
+        }
+        DiagnosticKind::RejectedData => warn!("Rejected invalid DATA record: {text}"),
+        DiagnosticKind::OversizedLine => warn!(
+            "Discarding {} bytes of an oversized DATA record",
+            diagnostic.bytes.len()
+        ),
+        DiagnosticKind::PartialLine => warn!("Discarding unterminated serial input: {text}"),
+    }
+}
+
+/// Gateway firmware logs through esp-println as `LEVEL - message`.
+fn gateway_log_level(text: &str) -> (Level, &str) {
+    for (prefix, level) in [
+        ("ERROR - ", Level::Error),
+        ("WARN - ", Level::Warn),
+        ("INFO - ", Level::Info),
+        ("DEBUG - ", Level::Debug),
+        ("TRACE - ", Level::Trace),
+    ] {
+        if let Some(message) = text.strip_prefix(prefix) {
+            return (level, message);
+        }
+    }
+    if text.contains("PANIC") {
+        (Level::Error, text)
+    } else {
+        (Level::Info, text)
+    }
+}
+
+fn queue_for_storage(sender: &SyncSender<ClimateReading>, reading: ClimateReading) {
+    let (stream, seq) = reading.describe();
+    match sender.try_send(reading) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            warn!("Storage queue full; dropping {stream} reading seq {seq}")
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            error!("Storage worker stopped; dropping {stream} reading seq {seq}")
+        }
+    }
+}
+
+/// Formats optional weather values, which the station omits when a sensor has no value.
+struct Optional<T>(Option<T>);
+
+impl<T: std::fmt::Display> std::fmt::Display for Optional<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(value) => value.fmt(formatter),
+            None => formatter.write_str("-"),
+        }
+    }
 }
 
 /// One explicitly selected serial device with read-only live and history HTTP.
@@ -94,11 +163,6 @@ pub struct Service {
     serial_thread: Option<JoinHandle<()>>,
     http: Option<http::HttpServer>,
     storage: Option<storage::Storage>,
-}
-
-struct StartOptions {
-    web_root: Option<PathBuf>,
-    log_status: Option<logs::LogStatusHandle>,
 }
 
 impl Service {
@@ -120,27 +184,6 @@ impl Service {
         )
     }
 
-    /// Starts the service with the daily-log worker's shared health state.
-    pub fn start_with_log_status(
-        serial_path: &str,
-        listener: TcpListener,
-        database_path: &Path,
-        log_status: logs::LogStatusHandle,
-        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
-        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
-    ) -> Result<Self, Error> {
-        let started = Instant::now();
-        Self::start_with_clock_and_status(
-            serial_path,
-            listener,
-            database_path,
-            Some(log_status),
-            utc_unix_ms,
-            move || started.elapsed(),
-            diagnostic,
-        )
-    }
-
     /// Starts the service and serves a built web application from `web_root`.
     pub fn start_with_web_root(
         serial_path: &str,
@@ -151,39 +194,11 @@ impl Service {
         diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
     ) -> Result<Self, Error> {
         let started = Instant::now();
-        Self::start_with_clock_status_and_web_root(
+        Self::start_with_clock_and_web_root(
             serial_path,
             listener,
             database_path,
-            StartOptions {
-                web_root: Some(web_root),
-                log_status: None,
-            },
-            utc_unix_ms,
-            move || started.elapsed(),
-            diagnostic,
-        )
-    }
-
-    /// Starts the service and serves a built web application from `web_root`.
-    pub fn start_with_web_root_and_log_status(
-        serial_path: &str,
-        listener: TcpListener,
-        database_path: &Path,
-        web_root: Option<PathBuf>,
-        log_status: logs::LogStatusHandle,
-        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
-        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
-    ) -> Result<Self, Error> {
-        let started = Instant::now();
-        Self::start_with_clock_status_and_web_root(
-            serial_path,
-            listener,
-            database_path,
-            StartOptions {
-                web_root,
-                log_status: Some(log_status),
-            },
+            Some(web_root),
             utc_unix_ms,
             move || started.elapsed(),
             diagnostic,
@@ -191,7 +206,7 @@ impl Service {
     }
 
     /// `elapsed` is a monotonic clock, independent of UTC reception timestamps.
-    /// Diagnostic callbacks must remain nonblocking, including operational events.
+    /// Diagnostic callbacks run on the serial thread, including operational events.
     pub fn start_with_clock(
         serial_path: &str,
         listener: TcpListener,
@@ -200,7 +215,7 @@ impl Service {
         elapsed: impl Fn() -> Duration + Send + 'static,
         diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
     ) -> Result<Self, Error> {
-        Self::start_with_clock_and_status(
+        Self::start_with_clock_and_web_root(
             serial_path,
             listener,
             database_path,
@@ -211,38 +226,19 @@ impl Service {
         )
     }
 
-    pub fn start_with_clock_and_status(
+    fn start_with_clock_and_web_root(
         serial_path: &str,
         listener: TcpListener,
         database_path: &Path,
-        log_status: Option<logs::LogStatusHandle>,
-        utc_unix_ms: impl Fn() -> i64 + Send + 'static,
-        elapsed: impl Fn() -> Duration + Send + 'static,
-        diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
-    ) -> Result<Self, Error> {
-        Self::start_with_clock_status_and_web_root(
-            serial_path,
-            listener,
-            database_path,
-            StartOptions {
-                web_root: None,
-                log_status,
-            },
-            utc_unix_ms,
-            elapsed,
-            diagnostic,
-        )
-    }
-
-    fn start_with_clock_status_and_web_root(
-        serial_path: &str,
-        listener: TcpListener,
-        database_path: &Path,
-        options: StartOptions,
+        web_root: Option<PathBuf>,
         utc_unix_ms: impl Fn() -> i64 + Send + 'static,
         elapsed: impl Fn() -> Duration + Send + 'static,
         mut diagnostic: impl FnMut(Diagnostic<'_>) + Send + 'static,
     ) -> Result<Self, Error> {
+        let mut diagnostic = move |event: Diagnostic<'_>| {
+            log_diagnostic(&event);
+            diagnostic(event);
+        };
         let serial_path = serial_path.to_owned();
         let initial_serial = serialport::new(&serial_path, 115_200)
             .timeout(Duration::from_millis(100))
@@ -256,8 +252,7 @@ impl Service {
             Arc::clone(&live),
             history,
             database_status,
-            options.log_status,
-            options.web_root,
+            web_root,
         )?;
         let stopping = Arc::new(AtomicBool::new(false));
         let serial_live = Arc::clone(&live);
@@ -303,7 +298,10 @@ impl Service {
                                     &mut diagnostic,
                                 );
                             }
-                            Err(_) => retry_at = elapsed() + Duration::from_secs(1),
+                            Err(error) => {
+                                debug!("Serial device {serial_path} still unavailable: {error}");
+                                retry_at = elapsed() + Duration::from_secs(1);
+                            }
                         }
                     }
                     if serial.is_none() {
@@ -312,6 +310,11 @@ impl Service {
                     }
                 }
                 let result = serial.as_mut().unwrap().read(&mut bytes);
+                if let Ok(len) = result
+                    && len > 0
+                {
+                    trace!("Read {len} bytes from serial device");
+                }
                 let now = elapsed();
                 let transition = serial_live.write().unwrap().gateway.expire(now);
                 if let Some(event) = transition {
@@ -331,6 +334,21 @@ impl Service {
                             ));
                             match record {
                                 Record::Weather(reading) => {
+                                    debug!(
+                                        "Weather reading seq {} from station {}: {} °C, {} %RH, wind {} m/s (gust {}) from {}°, rain {} mm, {} lx, UV {}, battery {}, RSSI {} dBm",
+                                        reading.seq,
+                                        reading.station_id,
+                                        Optional(reading.temperature_celsius),
+                                        Optional(reading.relative_humidity_percent),
+                                        Optional(reading.wind_speed_mps),
+                                        Optional(reading.gust_speed_mps),
+                                        Optional(reading.wind_direction_degrees),
+                                        reading.rain_mm,
+                                        Optional(reading.light_lux),
+                                        Optional(reading.uv_index),
+                                        if reading.battery_low { "low" } else { "ok" },
+                                        reading.rssi_dbm,
+                                    );
                                     transitions.extend(live.gateway.weather(reading.seq));
                                     let reading = LiveWeatherReading {
                                         reading,
@@ -338,11 +356,21 @@ impl Service {
                                     };
                                     live.weather = Some(reading.clone());
                                     drop(live);
-                                    let _ =
-                                        storage_sender.try_send(ClimateReading::Weather(reading));
+                                    queue_for_storage(
+                                        &storage_sender,
+                                        ClimateReading::Weather(reading),
+                                    );
                                 }
-                                Record::Heartbeat { .. } => {}
+                                Record::Heartbeat { boot_id } => {
+                                    trace!("Gateway heartbeat (boot {boot_id})")
+                                }
                                 Record::Indoor(reading) => {
+                                    debug!(
+                                        "Indoor reading seq {}: {} °C, {} %RH",
+                                        reading.seq,
+                                        reading.temperature_celsius,
+                                        reading.relative_humidity_percent,
+                                    );
                                     transitions.extend(live.gateway.indoor(reading.seq));
                                     let reading = LiveIndoorReading {
                                         reading,
@@ -350,8 +378,10 @@ impl Service {
                                     };
                                     live.indoor = Some(reading.clone());
                                     drop(live);
-                                    let _ =
-                                        storage_sender.try_send(ClimateReading::Indoor(reading));
+                                    queue_for_storage(
+                                        &storage_sender,
+                                        ClimateReading::Indoor(reading),
+                                    );
                                 }
                             }
                         },
@@ -385,6 +415,7 @@ impl Service {
                 }
             }
             framer.finish(&mut diagnostic);
+            debug!("Serial reader stopped");
         });
         Ok(Self {
             stopping,
@@ -398,10 +429,15 @@ impl Service {
 impl Drop for Service {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Relaxed);
+        debug!("Stopping HTTP server");
         self.http.take();
-        if let Some(thread) = self.serial_thread.take() {
-            let _ = thread.join();
+        debug!("Stopping serial reader");
+        if let Some(thread) = self.serial_thread.take()
+            && thread.join().is_err()
+        {
+            error!("Serial reader thread panicked");
         }
+        debug!("Stopping storage worker");
         self.storage.take();
     }
 }

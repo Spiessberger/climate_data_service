@@ -1,3 +1,4 @@
+use log::{info, warn};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -35,6 +36,43 @@ pub(crate) enum Event {
         boot_id: String,
         seq: u32,
     },
+}
+
+impl Event {
+    pub(crate) fn log(&self) {
+        match self {
+            Self::SerialConnected { path } => info!("Serial device {path} connected"),
+            Self::SerialUnavailable { path, error } => {
+                warn!("Serial device {path} unavailable: {error}; retrying every second")
+            }
+            Self::SerialDisconnected { path, error } => {
+                warn!("Serial device {path} disconnected: {error}; retrying every second")
+            }
+            Self::GatewayAvailable => info!("Gateway available"),
+            Self::GatewayTimeout => warn!(
+                "No valid gateway data for {} s; gateway marked unavailable",
+                TRAFFIC_TIMEOUT.as_secs()
+            ),
+            Self::GatewayRestart {
+                previous_boot_id,
+                boot_id,
+            } => warn!("Gateway restarted: boot {previous_boot_id} -> {boot_id}"),
+            Self::ReadingGap {
+                stream,
+                boot_id,
+                previous_seq,
+                seq,
+                observed_missing,
+            } => warn!(
+                "Missed {observed_missing} {stream} reading(s): seq {previous_seq} -> {seq} (boot {boot_id})"
+            ),
+            Self::ReadingSequenceAmbiguous {
+                stream,
+                boot_id,
+                seq,
+            } => warn!("Repeated {stream} reading seq {seq} (boot {boot_id})"),
+        }
+    }
 }
 
 /// Per-stream continuity in the current boot, with a lifetime observed loss total.

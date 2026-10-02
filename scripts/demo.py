@@ -7,6 +7,7 @@ from pathlib import Path
 import pty
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -14,14 +15,21 @@ import urllib.request
 def start_service(binary, serial, database):
     process = subprocess.Popen(
         [str(binary), "--serial", serial, "--listen", "127.0.0.1:0",
-         "--database", str(database), "--log-dir", str(database.parent / "logs")],
-        stderr=subprocess.PIPE, text=True,
+         "--database", str(database)],
+        stdout=subprocess.PIPE, text=True,
     )
-    startup = process.stderr.readline().strip()
-    if not startup.startswith("Listening on http://"):
+    for startup in process.stdout:
+        if "Listening on http://" in startup:
+            break
+        if " ERROR " in startup:
+            process.wait()
+            raise RuntimeError(f"Service failed to start: {startup.strip()}")
+    else:
         process.wait()
-        raise RuntimeError(f"Service failed to start: {startup}")
-    return process, startup.removeprefix("Listening on ")
+        raise RuntimeError("Service exited before listening")
+    # Keep draining service output so a full pipe never blocks the service.
+    threading.Thread(target=process.stdout.read, daemon=True).start()
+    return process, startup.split("Listening on ", 1)[1].strip()
 
 
 def stop_service(process):
@@ -31,7 +39,6 @@ def stop_service(process):
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
-    process.stderr.close()
 
 
 def get_json(url):

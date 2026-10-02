@@ -1,4 +1,4 @@
-use climate_data_service::{Service, logs::DailyLogs};
+use climate_data_service::Service;
 use rusqlite::Connection;
 use serde_json::Value;
 use serialport::{SerialPort, TTYPort};
@@ -179,76 +179,4 @@ fn blocked_database_keeps_live_and_heartbeat_handling_independent_and_drops_fail
         );
         thread::sleep(Duration::from_millis(10));
     }
-}
-
-#[test]
-fn failed_log_destination_is_independent_and_reopens_at_the_configured_path() {
-    let directory = tempfile::tempdir().unwrap();
-    let blocked_parent = directory.path().join("log-parent");
-    fs::write(&blocked_parent, b"occupied").unwrap();
-    let log_directory = blocked_parent.join("logs");
-    let logs = DailyLogs::start(&log_directory);
-    let log_status = logs.status_handle();
-    let (mut master, slave) = TTYPort::pair().unwrap();
-    let serial_path = slave.name().unwrap();
-    drop(slave);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let service = Service::start_with_log_status(
-        &serial_path,
-        listener,
-        &directory.path().join("climate.sqlite3"),
-        log_status,
-        || 1_800_000_000_123,
-        {
-            let sender = logs.sender();
-            move |diagnostic| sender.record(1_800_000_000_123, diagnostic)
-        },
-    )
-    .unwrap();
-
-    let live = || {
-        let mut client = TcpStream::connect(address).unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        client
-            .write_all(b"GET /live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .unwrap();
-        let mut response = String::new();
-        client.read_to_string(&mut response).unwrap();
-        serde_json::from_str::<Value>(response.split_once("\r\n\r\n").unwrap().1).unwrap()
-    };
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !live()["storage"]["logs"]["last_error"].is_string() {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(live()["storage"]["database"]["available"], true);
-
-    fs::remove_file(&blocked_parent).unwrap();
-    fs::create_dir(&blocked_parent).unwrap();
-    writeln!(master, "INFO - log destination recovered").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while live()["storage"]["logs"]["available"] != true {
-        assert!(
-            Instant::now() < deadline,
-            "log destination did not recover: {}",
-            live()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
-    let operational = fs::read_dir(&log_directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("operational"))
-        })
-        .unwrap();
-    let contents = fs::read_to_string(operational).unwrap();
-    assert!(contents.contains("log destination recovered"));
-    drop(service);
-    drop(logs);
 }
